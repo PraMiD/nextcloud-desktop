@@ -478,7 +478,7 @@ void SocketApi::command_EDIT(const QString &localFile, SocketListener *listener)
     if (!record.isValid())
         return;
 
-    DirectEditor* editor = getDirectEditorForLocalFile(fileData.localPath);
+    DirectEditor *editor = getDirectEditorForLocalFile(fileData.localPath);
     if (!editor)
         return;
 
@@ -490,11 +490,11 @@ void SocketApi::command_EDIT(const QString &localFile, SocketListener *listener)
     job->addQueryParams(params);
     job->usePOST();
 
-    QObject::connect(job, &JsonApiJob::jsonReceived, [](const QJsonDocument &json){
+    QObject::connect(job, &JsonApiJob::jsonReceived, [](const QJsonDocument &json) {
         auto data = json.object().value("ocs").toObject().value("data").toObject();
         auto url = QUrl(data.value("url").toString());
 
-        if(!url.isEmpty())
+        if (!url.isEmpty())
             Utility::openBrowser(url, nullptr);
     });
     job->start();
@@ -557,14 +557,15 @@ private slots:
         success(share->getLink().toString());
     }
 
-    void passwordRequired() {
+    void passwordRequired()
+    {
         bool ok;
         QString password = QInputDialog::getText(nullptr,
-                                                 tr("Password for share required"),
-                                                 tr("Please enter a password for your link share:"),
-                                                 QLineEdit::Normal,
-                                                 QString(),
-                                                 &ok);
+            tr("Password for share required"),
+            tr("Please enter a password for your link share:"),
+            QLineEdit::Normal,
+            QString(),
+            &ok);
 
         if (!ok) {
             // The dialog was canceled so no need to do anything
@@ -624,7 +625,8 @@ void SocketApi::command_COPY_PUBLIC_LINK(const QString &localFile, SocketListene
         return;
 
     AccountPtr account = fileData.folder->accountState()->account();
-    auto job = new GetOrCreatePublicLinkShare(account, fileData.accountRelativePath, [](const QString &url) { copyUrlToClipboard(url); }, this);
+    auto job = new GetOrCreatePublicLinkShare(
+        account, fileData.accountRelativePath, [](const QString &url) { copyUrlToClipboard(url); }, this);
     job->run();
 }
 
@@ -710,7 +712,7 @@ void SocketApi::command_GET_STRINGS(const QString &argument, SocketListener *lis
         { "CONTEXT_MENU_ICON", APPLICATION_ICON_NAME},
     } };
     listener->sendMessage(QString("GET_STRINGS:BEGIN"));
-    for (const auto& key_value : strings) {
+    for (const auto &key_value : strings) {
         if (argument.isEmpty() || argument == QLatin1String(key_value.first)) {
             listener->sendMessage(QString("STRING:%1:%2").arg(key_value.first, key_value.second));
         }
@@ -796,13 +798,13 @@ void SocketApi::command_GET_MENU_ITEMS(const QString &argument, OCC::SocketListe
 {
     listener->sendMessage(QString("GET_MENU_ITEMS:BEGIN"));
     bool hasSeveralFiles = argument.contains(QLatin1Char('\x1e')); // Record Separator
-    FileData fileData = hasSeveralFiles ? FileData{} : FileData::get(argument);
+    FileData fileData = hasSeveralFiles ? FileData {} : FileData::get(argument);
     bool isOnTheServer = fileData.journalRecord().isValid();
     auto flagString = isOnTheServer ? QLatin1String("::") : QLatin1String(":d:");
     auto capabilities = fileData.folder->accountState()->account()->capabilities();
 
     if (fileData.folder && fileData.folder->accountState()->isConnected()) {
-        DirectEditor* editor = getDirectEditorForLocalFile(fileData.localPath);
+        DirectEditor *editor = getDirectEditorForLocalFile(fileData.localPath);
         if (editor) {
             //listener->sendMessage(QLatin1String("MENU_ITEM:EDIT") + flagString + tr("Edit via ") + editor->name());
             listener->sendMessage(QLatin1String("MENU_ITEM:EDIT") + flagString + tr("Edit"));
@@ -815,7 +817,7 @@ void SocketApi::command_GET_MENU_ITEMS(const QString &argument, OCC::SocketListe
     listener->sendMessage(QString("GET_MENU_ITEMS:END"));
 }
 
-DirectEditor* SocketApi::getDirectEditorForLocalFile(const QString &localFile)
+DirectEditor *SocketApi::getDirectEditorForLocalFile(const QString &localFile)
 {
     FileData fileData = FileData::get(localFile);
     auto capabilities = fileData.folder->accountState()->account()->capabilities();
@@ -824,7 +826,7 @@ DirectEditor* SocketApi::getDirectEditorForLocalFile(const QString &localFile)
         QMimeDatabase db;
         QMimeType type = db.mimeTypeForFile(localFile);
 
-        DirectEditor* editor = capabilities.getDirectEditorForMimetype(type);
+        DirectEditor *editor = capabilities.getDirectEditorForMimetype(type);
         if (!editor) {
             editor = capabilities.getDirectEditorForOptionalMimetype(type);
         }
