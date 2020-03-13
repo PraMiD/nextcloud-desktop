@@ -21,6 +21,7 @@
 #include <QTimer>
 #include <QElapsedTimer>
 #include <QNetworkConfigurationManager>
+#include <QList>
 
 #include "qtsingleapplication.h"
 
@@ -31,6 +32,10 @@
 #include "progressdispatcher.h"
 #include "clientproxy.h"
 #include "folderman.h"
+
+#if defined(Q_OS_LINUX)
+#include "vfs.h"
+#endif
 
 class QMessageBox;
 class QSystemTrayIcon;
@@ -101,6 +106,10 @@ private:
 
     Theme *_theme;
 
+#if defined(Q_OS_LINUX)
+    QList<Vfs *> _vfs_mounts;
+#endif
+
     bool _helpOnly;
     bool _versionOnly;
 
@@ -123,7 +132,8 @@ private:
     QTimer _checkConnectionTimer;
 
 #if defined(WITH_CRASHREPORTER)
-    QScopedPointer<CrashReporter::Handler> _crashHandler;
+    QScopedPointer<CrashReporter::Handler>
+        _crashHandler;
 #endif
     QScopedPointer<FolderMan> _folderManager;
 };

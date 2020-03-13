@@ -48,6 +48,10 @@
 #include <windows.h>
 #endif
 
+#if defined(Q_OS_LINUX)
+#include "vfs_linux.h"
+#endif
+
 #if defined(WITH_CRASHREPORTER)
 #include <libcrashreporter-handler/Handler.h>
 #endif
@@ -133,7 +137,7 @@ Application::Application(int &argc, char **argv)
     // but only on Qt >= 5.7, where setDesktopFilename was introduced
 #if (QT_VERSION >= 0x050700)
     QString desktopFileName = QString(QLatin1String(LINUX_APPLICATION_ID)
-                                        + QLatin1String(".desktop"));
+        + QLatin1String(".desktop"));
     setDesktopFileName(desktopFileName);
 #endif
 
@@ -142,7 +146,8 @@ Application::Application(int &argc, char **argv)
     setAttribute(Qt::AA_UseHighDpiPixmaps, true);
 
     auto confDir = ConfigFile().configPath();
-    if (confDir.endsWith('/')) confDir.chop(1);  // macOS 10.11.x does not like trailing slash for rename/move.
+    if (confDir.endsWith('/'))
+        confDir.chop(1); // macOS 10.11.x does not like trailing slash for rename/move.
     if (!QFileInfo(confDir).isDir()) {
         // Migrate from version <= 2.4
         setApplicationName(_theme->appNameGUI());
@@ -154,7 +159,8 @@ Application::Application(int &argc, char **argv)
         // We need to use the deprecated QDesktopServices::storageLocation because of its Qt4
         // behavior of adding "data" to the path
         QString oldDir = QDesktopServices::storageLocation(QDesktopServices::DataLocation);
-        if (oldDir.endsWith('/')) oldDir.chop(1); // macOS 10.11.x does not like trailing slash for rename/move.
+        if (oldDir.endsWith('/'))
+            oldDir.chop(1); // macOS 10.11.x does not like trailing slash for rename/move.
         QT_WARNING_POP
         setApplicationName(_theme->appName());
         if (QFileInfo(oldDir).isDir()) {
@@ -289,6 +295,15 @@ Application::~Application()
     disconnect(AccountManager::instance(), &AccountManager::accountRemoved,
         this, &Application::slotAccountStateRemoved);
     AccountManager::instance()->shutdown();
+
+#if defined(Q_OS_LINUX)
+    for (auto vfs : _vfs_mounts) {
+        vfs->unmount();
+        delete vfs;
+    }
+
+    _vfs_mounts.erase(_vfs_mounts.begin(), _vfs_mounts.end());
+#endif
 }
 
 void Application::slotAccountStateRemoved(AccountState *accountState)
@@ -326,6 +341,53 @@ void Application::slotAccountStateAdded(AccountState *accountState)
         _folderManager.data(), &FolderMan::slotServerVersionChanged);
 
     _gui->slotTrayMessageIfServerUnsupported(accountState->account().data());
+
+
+#if defined(Q_OS_LINUX)
+    QString rootPath = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation) + "/.cachedFiles";
+    QVariant url = accountState->settings()->value("url");
+    QVariant user = accountState->settings()->value("webflow_user");
+
+    QString url_str = "unknown.url";
+    QString user_str = "unknown_user";
+
+    if (!url.canConvert(QMetaType::QString))
+        qWarning() << "Invalid URL for account. Using default value.";
+    else
+        url_str = url.toString();
+
+    if (!user.canConvert(QMetaType::QString))
+        qWarning() << "Invalid username for account. Using default value.";
+    else
+        user_str = user.toString();
+
+    QString mountPath = "/mnt/" + _theme->appName() + "/" + url_str.replace("http://", "").replace("https://", "").replace(".", "_") + "__" + user_str;
+    Vfs *new_vfs = new VfsLinux(mountPath, rootPath, accountState);
+    try {
+        new_vfs->mount();
+        _vfs_mounts.append(new_vfs);
+    } catch (VfsMountException &e) {
+        delete new_vfs;
+        qCritical() << "Could not mount VFS";
+    }
+#endif
+
+    //< For cron delete dir/files online. Execute each 60000 msec
+
+    //< Uncomment for test "Clean local folder" case.
+    /*_cronDeleteOnlineFiles = new QTimer(this);
+	connect(_cronDeleteOnlineFiles, SIGNAL(timeout()), this, SLOT(slotDeleteOnlineFiles()));
+	_cronDeleteOnlineFiles->start(60000);
+	*/
+
+    /* See SocketApi::command_SET_DOWNLOAD_MODE
+    //< Dummy example; Not uncomment
+    SyncJournalDb::instance()->setSyncMode(QString("C:/Users/poncianoj/zd"), SyncJournalDb::SYNCMODE_OFFLINE);
+    SyncJournalDb::instance()->setSyncMode(QString("C:/Users/poncianoj/zf.txt"), SyncJournalDb::SYNCMODE_ONLINE);
+
+    SyncJournalDb::instance()->updateLastAccess(QString("C:/Users/poncianoj/zd"));
+    SyncJournalDb::instance()->updateLastAccess(QString("C:/Users/poncianoj/zf.txt"));
+    */
 }
 
 void Application::slotCleanup()

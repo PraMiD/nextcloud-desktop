@@ -105,6 +105,7 @@ set(client_SRCS
     headerbanner.cpp
     iconjob.cpp
     remotewipe.cpp
+    vfs.cpp
     tray/ActivityData.cpp
     tray/ActivityListModel.cpp
     tray/UserModel.cpp
@@ -149,6 +150,10 @@ IF(BUILD_UPDATER)
         updater/updater.cpp
     )
 endif()
+
+IF( UNIX AND NOT APPLE )
+    list(APPEND client_SRCS vfs_linux.cpp)
+ENDIF()
 
 IF( APPLE )
     list(APPEND client_SRCS cocoainitializer_mac.mm)
@@ -252,9 +257,9 @@ endif()
 ecm_add_app_icon(final_src ICONS "${OWNCLOUD_ICONS}" SIDEBAR_ICONS "${OWNCLOUD_SIDEBAR_ICONS}" OUTFILE_BASENAME "${APPLICATION_ICON_NAME}")
 
 if(UNIX AND NOT APPLE)
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIE")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIE")
-  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -pie")
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIE -D_FILE_OFFSET_BITS=64")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIE -D_FILE_OFFSET_BITS=64")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -pie -D_FILE_OFFSET_BITS=64")
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
@@ -346,11 +351,15 @@ target_include_directories(${APPLICATION_EXECUTABLE} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-## handle DBUS for Fdo notifications
+## handle DBUS for Fdo notifications and FUSE
 if( UNIX AND NOT APPLE )
     find_package(Qt5 COMPONENTS DBus)
     target_link_libraries( ${APPLICATION_EXECUTABLE} Qt5::DBus)
     target_compile_definitions(${APPLICATION_EXECUTABLE} PRIVATE "USE_FDO_NOTIFICATIONS")
+
+    find_package(FUSE REQUIRED)
+    include_directories(${FUSE_INCLUDE_DIR})
+    target_link_libraries(${APPLICATION_EXECUTABLE} ${FUSE_LIBRARIES})
 endif()
 
 if (APPLE)
