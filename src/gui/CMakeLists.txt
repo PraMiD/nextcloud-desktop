@@ -106,6 +106,8 @@ set(client_SRCS
     iconjob.cpp
     remotewipe.cpp
     vfs.cpp
+    vfs_cache.cpp
+    vfs_utils.cpp
     tray/ActivityData.cpp
     tray/ActivityListModel.cpp
     tray/UserModel.cpp

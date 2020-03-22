@@ -13,6 +13,8 @@
 */
 
 #include "vfs_linux.h"
+#include "vfs_utils.h"
+#include "vfs_cache.h"
 
 #include <fuse.h>
 
@@ -34,18 +36,109 @@ void VfsLinux::initFuseStatic()
     fuse_initialized = true;
 }
 
+int VfsLinux::getattr(std::string path, struct stat *st, struct fuse_context *)
+{
+    // TODO: Check access rights
+    auto err = ENOENT;
 
-int VfsLinux::doGetattr(const char *, struct stat *)
-{
-    return -1;
+    if (path == "/") {
+        st->st_mode = S_IFDIR | 0740;
+        st->st_nlink = 2;
+        st->st_uid = _mountOwner;
+        st->st_gid = _mountGroup;
+        st->st_atime = _mountTime;
+        st->st_mtime = _mountTime;
+
+        err = 0;
+    } else {
+        try {
+            // Get directory listing of parent directory of the requested path
+            auto qpath = QString::fromStdString(path);
+            auto dir = VfsUtils::getDirectory(qpath);
+            auto file = VfsUtils::getFile(qpath);
+            auto data = _cache->getDirListing(dir);
+
+            err = ENOENT;
+            for (auto &f : data->list) {
+                if (f->path == file) {
+                    err = 0;
+                    // File found
+                    switch (f->type) {
+                    case ItemType::ItemTypeDirectory:
+                        st->st_mode = S_IFDIR;
+                        break;
+                    case ItemType::ItemTypeSoftLink:
+                        st->st_mode = S_IFLNK;
+                        break;
+                    case ItemType::ItemTypeFile:
+                        st->st_mode = S_IFREG;
+                        break;
+                    case ItemType::ItemTypeSkip:
+                        err = ENOENT;
+                    }
+                    st->st_mode |= 0740;
+                    st->st_nlink = 2;
+                    st->st_uid = _mountOwner;
+                    st->st_gid = _mountGroup;
+                    st->st_atime = f->modtime;
+                    st->st_mtime = f->modtime;
+
+                    err = 0;
+                    break;
+                }
+            }
+        } catch (VfsCacheNoSuchElementException &e) {
+            // No such element
+            err = ENOENT;
+        }
+    }
+
+    return -err;
 }
-int VfsLinux::doReaddir(const char *, void *, fuse_fill_dir_t, off_t, struct fuse_file_info *)
+
+int VfsLinux::readdir(std::string path, void *buf, fuse_fill_dir_t filler, off_t, struct fuse_file_info *, struct fuse_context *)
 {
-    return -1;
+    int err = ENOENT;
+    filler(buf, ".", NULL, 0);
+    filler(buf, "..", NULL, 0);
+
+    try {
+        auto data = _cache->getDirListing(QString::fromStdString(path));
+        for (auto &e : data->list)
+            filler(buf, e->path, NULL, 0);
+        err = 0;
+    } catch (VfsCacheNoSuchElementException &e) {
+        // No such element
+        err = ENOENT;
+    }
+    return -err;
 }
-int VfsLinux::doRead(const char *, char *, size_t, off_t, struct fuse_file_info *)
+
+int VfsLinux::read(const char *c_path, char *buf, size_t size, off_t off, struct fuse_file_info *fi, struct fuse_context *)
 {
-    return -1;
+    return -ENOENT;
+}
+
+int VfsLinux::doGetattr(const char *c_path, struct stat *st)
+{
+    qDebug() << Q_FUNC_INFO;
+
+    auto ctx = fuse_get_context();
+    return static_cast<VfsLinux *>(ctx->private_data)->getattr(c_path, st, ctx);
+}
+int VfsLinux::doReaddir(const char *c_path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *file_info)
+{
+    qDebug() << Q_FUNC_INFO;
+
+    auto ctx = fuse_get_context();
+    return static_cast<VfsLinux *>(ctx->private_data)->readdir(c_path, buf, filler, offset, file_info, ctx);
+}
+int VfsLinux::doRead(const char *c_path, char *buf, size_t size, off_t off, struct fuse_file_info *fi)
+{
+    qDebug() << Q_FUNC_INFO;
+
+    auto ctx = fuse_get_context();
+    return static_cast<VfsLinux *>(ctx->private_data)->read(c_path, buf, size, off, fi, ctx);
 }
 
 VfsLinux::VfsLinux(QString &mountPath, QString &cachePath, AccountState *accState)
@@ -65,7 +158,7 @@ void VfsLinux::mount()
         if (!QDir::root().mkpath(this->_mountpath)) {
             // Cannot create directory
             auto msg = "Cannot create mountpath: " + this->_mountpath;
-            qCritical() << msg;
+            qCritical() << Q_FUNC_INFO << msg;
             throw VfsMountException(msg.toUtf8().constData());
         }
 
@@ -75,14 +168,14 @@ void VfsLinux::mount()
     if (!mountPointFi.isDir()) {
         // Cannot mount on files
         auto msg = "Mountpath is not a directory: " + this->_mountpath;
-        qCritical() << msg;
+        qCritical() << Q_FUNC_INFO << msg;
         throw VfsMountException(msg.toUtf8().constData());
     }
 
     if (!QDir(this->_mountpath).isEmpty()) {
         // Cannot mount on non-empty directories
         auto msg = "Mountpoint not empty: " + this->_mountpath;
-        qCritical() << msg;
+        qCritical() << Q_FUNC_INFO << msg;
         throw VfsMountException(msg.toUtf8().constData());
     }
 
@@ -90,39 +183,53 @@ void VfsLinux::mount()
     char *argv[0] = {};
     struct fuse_args args = FUSE_ARGS_INIT(0, argv);
     if ((
-            _fuse_chan = fuse_mount(
+            _fuseChan = fuse_mount(
                 this->_mountpath.toUtf8().constData(), &args))
         == NULL) {
         auto msg = "Could not mount FUSE: " + this->_mountpath;
-        qCritical() << msg;
+        qCritical() << Q_FUNC_INFO << msg;
         throw VfsMountException(msg.toUtf8().constData());
     }
 
     if ((
-            _fuse_fs = fuse_new(_fuse_chan, &args, &_ops, sizeof(_ops), this))
+            _fuseFs = fuse_new(_fuseChan, &args, &_ops, sizeof(_ops), this))
         == NULL) {
         auto msg = "Could not setup FUSE: " + this->_mountpath;
-        qCritical() << msg;
+        qCritical() << Q_FUNC_INFO << msg;
+        throw VfsMountException(msg.toUtf8().constData());
+    }
+
+    _mountTime = time(NULL);
+    _mountOwner = getuid();
+    _mountGroup = getgid();
+
+    // Setup our cache
+    try {
+        _cache = new VfsCache(_cachepath, _accState);
+        qDebug() << Q_FUNC_INFO << "Cache for VFS at " << this->_mountpath << "set up";
+    } catch (VfsCacheException &e) {
+        auto msg = "Cannot setup VFS (" + this->_mountpath + "). Cache could not be created: " + e.what();
+        qCritical() << Q_FUNC_INFO << msg;
         throw VfsMountException(msg.toUtf8().constData());
     }
 
     // Enter the FUSE loop in another thread
-    moveToThread(&_fuse_thread);
-    connect(&_fuse_thread, &QThread::started,
+    _fuseThread.setObjectName("VfsFuseThread");
+    connect(&_fuseThread, &QThread::started,
         [this]() {
-            fuse_loop(_fuse_fs);
-            fuse_unmount(this->_mountpath.toUtf8().constData(), _fuse_chan);
-            fuse_destroy(_fuse_fs);
-
-            qInfo() << "Mounted fuse FS at: " + this->_mountpath;
+            qInfo() << Q_FUNC_INFO << "Mounting fuse FS/VFS at: " + this->_mountpath;
+            fuse_loop(_fuseFs);
+            fuse_unmount(this->_mountpath.toUtf8().constData(), _fuseChan);
+            fuse_destroy(_fuseFs);
         });
-    _fuse_thread.start();
+    _fuseThread.start();
 }
 
 void VfsLinux::unmount()
 {
     // TODO: Wait until FUSE is actually unmounted
-    fuse_exit(_fuse_fs);
+    fuse_exit(_fuseFs);
+    qInfo() << Q_FUNC_INFO << "Unmounted FUSE/VFS: " + this->_mountpath;
 }
 
 } // namespace OCC

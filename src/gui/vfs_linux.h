@@ -19,11 +19,14 @@
 
 #include "accountstate.h"
 #include "vfs.h"
+#include "vfs_cache.h"
 
 #include <fuse.h>
+#include <time.h>
 
 #include <QString>
 #include <QThread>
+#include <QPointer>
 
 namespace OCC {
 
@@ -39,11 +42,20 @@ public:
 private:
     QString _mountpath;
     QString _cachepath;
-    AccountState *_accState;
+    QPointer<AccountState> _accState;
+    QPointer<VfsCache> _cache;
 
-    struct fuse_chan *_fuse_chan;
-    struct fuse *_fuse_fs;
-    QThread _fuse_thread;
+    struct fuse_chan *_fuseChan;
+    struct fuse *_fuseFs;
+    QThread _fuseThread;
+
+    time_t _mountTime;
+    uid_t _mountOwner;
+    uid_t _mountGroup;
+
+    int getattr(std::string, struct stat *, struct fuse_context *);
+    int readdir(std::string, void *, fuse_fill_dir_t, off_t, struct fuse_file_info *, struct fuse_context *);
+    int read(const char *, char *, size_t, off_t, struct fuse_file_info *, struct fuse_context *);
 
     static bool fuse_initialized;
     static struct fuse_operations _ops;

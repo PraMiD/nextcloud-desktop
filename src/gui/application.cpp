@@ -295,6 +295,19 @@ Application::~Application()
     disconnect(AccountManager::instance(), &AccountManager::accountRemoved,
         this, &Application::slotAccountStateRemoved);
     AccountManager::instance()->shutdown();
+}
+
+void Application::slotAccountStateRemoved(AccountState *accountState)
+{
+    /*
+	if (_cronDeleteOnlineFiles)
+    {
+        disconnect(_cronDeleteOnlineFiles, SIGNAL(timeout()), this, SLOT(slotDeleteOnlineFiles()));
+        _cronDeleteOnlineFiles->stop();
+        delete _cronDeleteOnlineFiles;
+        _cronDeleteOnlineFiles = NULL;
+    }
+	*/
 
 #if defined(Q_OS_LINUX)
     for (auto vfs : _vfs_mounts) {
@@ -304,10 +317,7 @@ Application::~Application()
 
     _vfs_mounts.erase(_vfs_mounts.begin(), _vfs_mounts.end());
 #endif
-}
 
-void Application::slotAccountStateRemoved(AccountState *accountState)
-{
     if (_gui) {
         disconnect(accountState, &AccountState::stateChanged,
             _gui.data(), &ownCloudGui::slotAccountStateChanged);
@@ -368,7 +378,7 @@ void Application::slotAccountStateAdded(AccountState *accountState)
         _vfs_mounts.append(new_vfs);
     } catch (VfsMountException &e) {
         delete new_vfs;
-        qCritical() << "Could not mount VFS";
+        qCritical() << "Could not mount VFS: " << mountPath;
     }
 #endif
 

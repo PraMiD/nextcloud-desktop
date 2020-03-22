@@ -25,7 +25,6 @@ set(libsync_SRCS
     bandwidthmanager.cpp
     capabilities.cpp
     cookiejar.cpp
-    discoveryphase.cpp
     filesystem.cpp
     logger.cpp
     accessmanager.cpp
@@ -54,6 +53,7 @@ set(libsync_SRCS
     theme.cpp
     clientsideencryption.cpp
     clientsideencryptionjobs.cpp
+    discoveryphase.cpp
     creds/dummycredentials.cpp
     creds/abstractcredentials.cpp
     creds/credentialscommon.cpp
