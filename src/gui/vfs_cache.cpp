@@ -16,6 +16,7 @@
 #include <QDir>
 #include <QThread>
 #include <QMutexLocker>
+#include <QScopedPointer>
 
 #include "vfs_cache.h"
 #include "vfs_utils.h"
@@ -25,6 +26,7 @@ VfsCache::VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs)
     : _accState(accState)
     , _cacheDir(cacheDir)
     , _refreshTime(refreshTimeMs)
+    , _dictWalker(accState->account())
     , _threadRunning(false)
 {
     // Check if the cache directory exists
@@ -59,10 +61,9 @@ VfsCache::VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs)
     if (QFileInfo(file_info.absoluteFilePath() + "/vfs-metadata").exists())
         loadCacheState();
 
-    //_fileListWorker = new OCC::DiscoveryFolderFileList(_accState->account());
-    //_fileListWorker->setParent(this);
-    //connect(this, &VfsCache::startFileUpdate, _fileListWorker, &OCC::DiscoveryFolderFileList::doGetFolderContent);
-    //connect(_fileListWorker, &OCC::DiscoveryFolderFileList::gotDataSignal, this, &VfsCache::fileUpdateFinished);
+    _dictWalker.setParent(this);
+    connect(this, &VfsCache::loadFolderContent, &_dictWalker, &OCC::DiscoveryFolderFileList::doGetFolderContent);
+    connect(&_dictWalker, &OCC::DiscoveryFolderFileList::gotDataSignal, this, &VfsCache::handleDirectoryUpdate);
 
 
     _threadRunning = true;
@@ -86,46 +87,54 @@ VfsCache::VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs)
 
 void VfsCache::updateCurFileList()
 {
-    // Ensure thread safety
-    /*auto curPaths = _fileMap.keys();
+    // TODO: Ensure thread safety
+    auto curPaths = _fileMap.keys();
     for (auto p : curPaths)
-        loadFileList(p);*/
+        loadFileList(p);
 }
 
 void VfsCache::loadFileList(QString path)
 {
-    _fileListMut.lock();
-    emit startFileUpdate(path);
-
-    // Wait for the results
-    _updateCondVar.wait(&_fileListMut);
-    _fileListMut.unlock();
+    try {
+        qDebug() << Q_FUNC_INFO << "Starting directory update for path:" << path;
+        {
+            QMutexLocker locker(&_fileListMut);
+            emit loadFolderContent(path);
+            _updateCondVar.wait(&_fileListMut);
+        }
+    } catch (VfsCacheNoSuchElementException &e) {
+        qCritical() << Q_FUNC_INFO << "Path does not exist:" << e.what();
+    } catch (VfsCacheException &e) {
+        qCritical() << Q_FUNC_INFO << "Could not finish update:" << e.what();
+    }
 }
 
-void VfsCache::fileUpdateFinished(DiscoveryDirectoryResult *res)
+void VfsCache::handleDirectoryUpdate(DiscoveryDirectoryResult *res)
 {
-    /*_fileListMut.lock();
-    qDebug() << Q_FUNC_INFO << "File update returned";
+    qDebug()
+        << Q_FUNC_INFO << "File update returned";
 
     QString path = res->path;
+    {
+        QMutexLocker locker(&_fileListMut);
 
-    // Only delete the old cached information if we got a valid result or the
-    // entry does no longer exist
-    if (res->code == ENOENT || res->code == 0) {
-        // Old element is deleted -> Shared Pointer is no longer referenced
-        _fileMap.remove(path);
-    } else {
-        // Error on update..
-        qWarning() << Q_FUNC_INFO << "Update for path '" << res->path << "' failed";
+        // Only delete the old cached information if we got a valid result or the
+        // entry does no longer exist
+        if (res->code == ENOENT || res->code == 0) {
+            // Old element is deleted -> Shared Pointer is no longer referenced
+            _fileMap.remove(path);
+        } else {
+            // Error on update..
+            qWarning() << Q_FUNC_INFO << "Update for path '" << res->path << "' failed";
+        }
+
+        // Only update the cached information if we got a valid result
+        if (res->code == 0)
+            _fileMap.insert(path, QSharedPointer<OCC::DiscoveryDirectoryResult>(res));
     }
 
-    // Only update the cached information if we got a valid result
-    if (res->code == 0)
-        _fileMap.insert(path, QSharedPointer<OCC::DiscoveryDirectoryResult>(res));
-    _fileListMut.unlock();
-
     qDebug() << Q_FUNC_INFO << "Updated file/directory listing in VfsCache for " + path;
-    _updateCondVar.wakeAll();*/
+    _updateCondVar.wakeAll();
 }
 
 VfsCache::~VfsCache()
@@ -145,7 +154,6 @@ void VfsCache::storeCacheState()
 
 QSharedPointer<OCC::DiscoveryDirectoryResult> VfsCache::getDirListing(QString path)
 {
-    /*
     {
         QMutexLocker locker(&_fileListMut);
         if (_fileMap.contains(path)) {
@@ -163,7 +171,7 @@ QSharedPointer<OCC::DiscoveryDirectoryResult> VfsCache::getDirListing(QString pa
             qWarning() << Q_FUNC_INFO << "Could not load content of requested directory: " + path;
             throw VfsCacheNoSuchElementException(path.toUtf8().constData());
         }
-    }*/
+    }
 }
 
 QString VfsCache::cacheFile(QString onlinePath)

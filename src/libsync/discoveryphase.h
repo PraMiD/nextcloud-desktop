@@ -207,4 +207,31 @@ signals:
     // A new folder was discovered and was not synced because of the confirmation feature
     void newBigFolder(const QString &folder, bool isExternal);
 };
+class OWNCLOUDSYNC_EXPORT DiscoveryFolderFileList : public QObject
+{
+    Q_OBJECT
+
+    QPointer<DiscoverySingleDirectoryJob> _singleDirJob;
+    AccountPtr _account;
+    DiscoveryDirectoryResult *_DiscoveryFolderFileListResult;
+    bool _firstFolderProcessed;
+
+public:
+    DiscoveryFolderFileList(AccountPtr account)
+        : QObject()
+        , _account(account)
+        , _DiscoveryFolderFileListResult(0)
+        , _firstFolderProcessed(false)
+    {
+    }
+    QByteArray _dataFingerprint;
+    void setFolderContentSyncMode(QString path);
+
+public slots:
+    void singleDirectoryJobResultSlot();
+    void singleDirectoryJobFinishedWithErrorSlot(int csyncErrnoCode, const QString &msg);
+    void doGetFolderContent(const QString &subPath);
+signals:
+    void gotDataSignal(DiscoveryDirectoryResult *dr);
+};
 }

@@ -81,11 +81,13 @@ private:
     QThread _cacheThread;
     int _refreshTime;
 
+    DiscoveryFolderFileList _dictWalker;
+
     bool _threadRunning;
     QMutex _fileListMut;
     QWaitCondition _updateCondVar;
 
-    //QMap<QString, QSharedPointer<OCC::DiscoveryDirectoryResult>> _fileMap;
+    QMap<QString, QSharedPointer<OCC::DiscoveryDirectoryResult>> _fileMap;
     //QMap<QString, QSharedPointer<VfsCacheFile>> _cachedFiles;
 
     void
@@ -99,10 +101,10 @@ private:
 
 
 private slots:
-    void fileUpdateFinished(OCC::DiscoveryDirectoryResult *);
+    void handleDirectoryUpdate(OCC::DiscoveryDirectoryResult *);
 
 signals:
-    void startFileUpdate(QString path);
+    void loadFolderContent(QString path);
 
 public:
     VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs = 10000);
