@@ -27,6 +27,7 @@
 
 #include "accountstate.h"
 #include "discoveryphase.h"
+#include "syncengine.h"
 
 namespace OCC {
 class VfsCacheException : public std::exception
@@ -76,10 +77,13 @@ class VfsCache : public QObject
 
 private:
     QPointer<AccountState> _accState;
-    //QPointer<DiscoveryFolderFileList> _fileListWorker;
     QString _cacheDir;
+    QString _fileCacheDir;
     QThread _cacheThread;
     int _refreshTime;
+
+    QString _excludeFilesPath;
+    QStringList _excludedItems;
 
     DiscoveryFolderFileList _dictWalker;
 
@@ -87,24 +91,41 @@ private:
     QMutex _fileListMut;
     QWaitCondition _updateCondVar;
 
-    QMap<QString, QSharedPointer<OCC::DiscoveryDirectoryResult>> _fileMap;
-    //QMap<QString, QSharedPointer<VfsCacheFile>> _cachedFiles;
+    SyncJournalDb *_journal;
+    SyncEngine *_eng;
 
-    void
-    loadCacheState();
-    void storeCacheState();
+    QMap<QString, QSharedPointer<OCC::DiscoveryDirectoryResult>> _fileMap;
+    QMap<QString, QSharedPointer<VfsCacheFile>> _cachedFiles;
+
+    bool _syncStarted;
 
     void updateCurFileList();
     void loadFileList(QString);
 
     QString cacheFile(QString);
 
+    void setSyncOptions();
+
+    void buildExcludeList();
+    void syncExcludedFiles();
+
+    QStringList getDirsInDir(QString path);
+    QStringList getFilesInDir(QString path);
+    bool canIgnoreFile(QString path);
+    bool canIgnoreDir(QString path);
+
 
 private slots:
     void handleDirectoryUpdate(OCC::DiscoveryDirectoryResult *);
+    void syncFinished(bool);
+    void syncStarted();
+    void etagReceived(const QString &);
+    void syncUnavailable();
+    void syncError(const QString &, ErrorCategory category = ErrorCategory::Normal);
+    void engineItemProcessed(const SyncFileItemPtr &);
 
 signals:
-    void loadFolderContent(QString path);
+    void loadFolderContent(QString);
 
 public:
     VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs = 10000);

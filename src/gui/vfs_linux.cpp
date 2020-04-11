@@ -21,6 +21,10 @@
 #include <QFileInfo>
 #include <QDir>
 
+/* Hints:
+ * void SyncJournalDb::forceRemoteDiscoveryNextSyncLocked()
+ */
+
 namespace OCC {
 
 bool VfsLinux::fuse_initialized = false;
@@ -64,27 +68,33 @@ int VfsLinux::getattr(std::string path, struct stat *st, struct fuse_context *)
                     err = 0;
                     // File found
                     switch (f->type) {
+                    case ItemType::ItemTypeSkip:
+                        err = ENOENT;
                     case ItemType::ItemTypeDirectory:
                         st->st_mode = S_IFDIR;
+                        err = 0;
                         break;
                     case ItemType::ItemTypeSoftLink:
                         st->st_mode = S_IFLNK;
+                        err = 0;
                         break;
                     case ItemType::ItemTypeFile:
                         st->st_mode = S_IFREG;
+                        st->st_mode |= 0740;
+                        err = 0;
                         break;
-                    case ItemType::ItemTypeSkip:
-                        err = ENOENT;
                     }
-                    st->st_mode |= 0740;
-                    st->st_nlink = 2;
-                    st->st_uid = _mountOwner;
-                    st->st_gid = _mountGroup;
-                    st->st_atime = f->modtime;
-                    st->st_mtime = f->modtime;
 
-                    err = 0;
-                    break;
+                    if (err == 0) {
+                        st->st_nlink = 2;
+                        st->st_uid = _mountOwner;
+                        st->st_gid = _mountGroup;
+                        st->st_atime = f->modtime;
+                        st->st_mtime = f->modtime;
+                        st->st_size = f->size;
+                        st->st_blksize = 1;
+                        st->st_blocks = f->size / 512 + ((f->size % 512) > 1);
+                    }
                 }
             }
         } catch (VfsCacheNoSuchElementException &e) {
