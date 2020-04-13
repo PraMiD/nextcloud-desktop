@@ -69,6 +69,7 @@ public:
     QDateTime download;
     QString onlinePath;
     QString offlinePath;
+    QSharedPointer<QFile> fh;
 };
 
 class VfsCache : public QObject
@@ -82,7 +83,6 @@ private:
     QThread _cacheThread;
     int _refreshTime;
 
-    QString _excludeFilesPath;
     QStringList _excludedItems;
 
     DiscoveryFolderFileList _dictWalker;
@@ -96,23 +96,30 @@ private:
 
     QMap<QString, QSharedPointer<OCC::DiscoveryDirectoryResult>> _fileMap;
     QMap<QString, QSharedPointer<VfsCacheFile>> _cachedFiles;
+    qint64 _cacheSecs;
+
+    QMap<QString, QPair<QSharedPointer<QMutex>, QSharedPointer<QWaitCondition>>> _waitForSyncFiles;
 
     bool _syncStarted;
 
     void updateCurFileList();
     void loadFileList(QString);
 
-    QString cacheFile(QString);
+    QSharedPointer<VfsCacheFile> cacheFile(QString);
 
     void setSyncOptions();
+    void doSync();
+    void doSyncForFile(QString path);
 
     void buildExcludeList();
-    void syncExcludedFiles();
+    bool checkCacheFiles();
 
     QStringList getDirsInDir(QString path);
     QStringList getFilesInDir(QString path);
     bool canIgnoreFile(QString path);
     bool canIgnoreDir(QString path);
+
+    bool isFile(QString path);
 
 
 private slots:
@@ -132,7 +139,7 @@ public:
     ~VfsCache();
 
     QSharedPointer<OCC::DiscoveryDirectoryResult> getDirListing(QString);
-    QString readFile(QString, off_t, size_t);
+    const QString readFile(QString, off_t, size_t);
 };
 }
 

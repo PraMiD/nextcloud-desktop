@@ -35,6 +35,7 @@ VfsCache::VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs)
     , _refreshTime(refreshTimeMs)
     , _dictWalker(accState->account())
     , _threadRunning(false)
+    , _cacheSecs(5)
 {
     // Check if the cache directory exists
     auto file_info = QFileInfo(this->_cacheDir);
@@ -86,8 +87,6 @@ VfsCache::VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs)
     connect(_eng, &SyncEngine::syncError, this, &VfsCache::syncError);
     connect(_eng, &SyncEngine::itemCompleted, this, &VfsCache::engineItemProcessed);
 
-    _excludeFilesPath = file_info.absoluteFilePath() + "/ignore.lst";
-    _eng->excludedFiles().addExcludeFilePath(_excludeFilesPath);
     // TODO: Load cache!
     buildExcludeList();
 
@@ -104,45 +103,47 @@ VfsCache::VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs)
             while (_threadRunning) {
                 qDebug() << Q_FUNC_INFO << "Refresh the directory listings of all currently cached directories";
                 _eng->setLocalDiscoveryOptions(LocalDiscoveryStyle::FilesystemOnly);
-                if (!_eng->isSyncRunning() && !_syncStarted) {
-                    qDebug() << Q_FUNC_INFO << "NO SYNC RUNNING";
-                    if (_accState->isConnected()) {
-                        qDebug() << Q_FUNC_INFO << "STARTING SYNC";
-                        setSyncOptions();
-                        _syncStarted = true;
-                        QMetaObject::invokeMethod(_eng, "startSync", Qt::QueuedConnection);
-                    } else {
-                        qDebug() << Q_FUNC_INFO << "Not connected";
-                    }
-                }
+
 
                 updateCurFileList();
+                if (checkCacheFiles()) // Remote discovery if files were removed from cache
+                    _eng->journal()->forceRemoteDiscoveryNextSync();
                 buildExcludeList();
+                doSync();
                 _cacheThread.msleep(_refreshTime);
             }
         });
     _cacheThread.start();
 }
 
-void VfsCache::syncExcludedFiles()
+void VfsCache::doSync()
 {
-    QFile f(_excludeFilesPath);
-    f.open(QIODevice::Unbuffered | QIODevice::Truncate | QIODevice::WriteOnly);
+    if (!_eng->isSyncRunning() && !_syncStarted) {
+        if (_accState->isConnected()) {
+            setSyncOptions();
+            _syncStarted = true;
+            QMetaObject::invokeMethod(_eng, "startSync", Qt::QueuedConnection);
+        } else {
+            qWarning() << Q_FUNC_INFO << "Not connected!";
+        }
+    }
+}
 
-    // We have to replace leading / for the sync engine
-    QStringList exportList;
-    std::transform(_excludedItems.begin(), _excludedItems.end(), std::back_inserter(exportList), [](auto &path) {
-        if (path == "/")
-            return QString("*");
-        if (path.startsWith("/"))
-            return path.remove(0, 1);
-        return path;
-    });
-    auto data = QString(exportList.join("\n") + "\n");
-    f.write(data.toUtf8().data(), data.length());
-    f.close();
-    if (_eng)
-        _eng->excludedFiles().reloadExcludeFiles();
+void VfsCache::doSyncForFile(QString path)
+{
+    qDebug() << Q_FUNC_INFO << "Sync and wait for file" << path << "being processed";
+    QSharedPointer<QMutex> mut(new QMutex());
+    QSharedPointer<QWaitCondition> waitCond(new QWaitCondition());
+    QPair<QSharedPointer<QMutex>, QSharedPointer<QWaitCondition>> syncPair(mut, waitCond);
+
+    _waitForSyncFiles.insert(path, syncPair);
+
+    QMutexLocker locker(mut.data());
+    doSync();
+    waitCond->wait(mut.data());
+    qDebug() << Q_FUNC_INFO << "File" << path << "processed";
+
+    _waitForSyncFiles.remove(path);
 }
 
 void VfsCache::setSyncOptions()
@@ -193,7 +194,18 @@ void VfsCache::setSyncOptions()
 
 void VfsCache::engineItemProcessed(const SyncFileItemPtr &item)
 {
-    auto file = item->_file;
+    auto file = QString("/" + item->_file);
+
+    if (_waitForSyncFiles.contains(file)) {
+        qDebug() << Q_FUNC_INFO << "Processing wait file:" << file;
+        auto mut = _waitForSyncFiles.value(file).first;
+        auto condVar = _waitForSyncFiles.value(file).second;
+
+        QMutexLocker locker(mut.data());
+        condVar->wakeAll();
+    }
+    qDebug() << Q_FUNC_INFO << file << item->_status << item->_instruction;
+
     switch (item->_status) {
     case SyncFileItem::Status::Success:
         qDebug() << Q_FUNC_INFO << "Processed" << file << "successfully";
@@ -219,12 +231,15 @@ void VfsCache::engineItemProcessed(const SyncFileItemPtr &item)
         case CSYNC_INSTRUCTION_SYNC:
             qDebug() << Q_FUNC_INFO << "CSYNC_INSTRUCTION_SYNC";
             break;
+        case CSYNC_INSTRUCTION_REMOVE:
+            qDebug() << Q_FUNC_INFO << "CSYNC_INSTRUCTION_REMOVE";
+            break;
         default:
             qDebug() << Q_FUNC_INFO << "I don't know.." << item->_instruction;
         }
         break;
     case SyncFileItem::Status::FileIgnored:
-        qDebug() << Q_FUNC_INFO << "file" << file << "ignored";
+        qDebug() << Q_FUNC_INFO << "file" << file << "ignored:" << item->_instruction;
         break;
     default:
         qDebug() << Q_FUNC_INFO << "file" << file << "different status:" << item->_status;
@@ -354,12 +369,16 @@ void VfsCache::buildExcludeList()
 
         for (auto path : toVisitPaths) {
             if (canIgnoreDir(path)) {
+                if (path != "/")
+                    path = path.right(path.length() - 1);
                 _excludedItems.append(path);
             } else {
                 // Check if single files can be ignored
                 for (auto fPath : getFilesInDir(path)) {
                     if (canIgnoreFile(fPath))
-                        _excludedItems.append(fPath);
+                        if (fPath != "/")
+                            fPath = fPath.right(fPath.length() - 1);
+                    _excludedItems.append(fPath);
                 }
 
                 // Add subdirectries to new check list
@@ -370,7 +389,10 @@ void VfsCache::buildExcludeList()
         toVisitPaths = newVisitPaths;
     }
 
-    syncExcludedFiles();
+    qDebug() << Q_FUNC_INFO << _excludedItems;
+    qDebug() << Q_FUNC_INFO << _cachedFiles.keys();
+    // TODO: Ensure that file is synced before it is deleted
+    _journal->setSelectiveSyncList(SyncJournalDb::SelectiveSyncBlackList, _excludedItems);
 }
 
 QStringList VfsCache::getDirsInDir(QString dir)
@@ -418,7 +440,7 @@ bool VfsCache::canIgnoreDir(QString path)
     return match == cachedPaths.cend();
 }
 
-QString VfsCache::cacheFile(QString onlinePath)
+QSharedPointer<VfsCacheFile> VfsCache::cacheFile(QString onlinePath)
 {
     QString onlineDir = VfsUtils::getDirectory(onlinePath);
     QString filename = VfsUtils::getFile(onlinePath);
@@ -434,27 +456,87 @@ QString VfsCache::cacheFile(QString onlinePath)
 
     // Check if the file is already cached
     if (_cachedFiles.contains(onlinePath))
-        return _cachedFiles.value(onlinePath)->offlinePath;
+        return _cachedFiles.value(onlinePath);
 
     // Download file and add it to the cache
     qInfo() << Q_FUNC_INFO << "Add" << onlinePath << "to cache";
     QSharedPointer<VfsCacheFile> newFileInfo = QSharedPointer<VfsCacheFile>(new VfsCacheFile());
     newFileInfo->onlinePath = onlinePath;
     newFileInfo->offlinePath = VfsUtils::pathJoin(_fileCacheDir, onlinePath.right(onlinePath.length() - 1));
-    qInfo() << Q_FUNC_INFO << newFileInfo->offlinePath;
+    newFileInfo->download = newFileInfo->lastAccess = QDateTime::currentDateTime();
     _cachedFiles.insert(onlinePath, newFileInfo);
     buildExcludeList(); // Tell the syncEngine to not ignore the file
+
+    // Blocks until the file is processed by the engine
+    _eng->journal()->forceRemoteDiscoveryNextSync();
+    doSyncForFile(onlinePath);
 
 
     // TODO: Handle symlinks correctly: Do we have to follow the link or is this
     //          done by the server
 
-    return newFileInfo->offlinePath;
+    return newFileInfo;
 }
 
-QString VfsCache::readFile(QString onlinePath, off_t offset, size_t noBytes)
+const QString VfsCache::readFile(QString onlinePath, off_t offset, size_t noBytes)
 {
     // Cache file (if not already cached)
-    auto offlinePath = cacheFile(onlinePath);
+    if (!isFile(onlinePath)) {
+        qCritical() << Q_FUNC_INFO << "FUSE requested unknown existing file:" << onlinePath;
+        throw VfsCacheNoSuchElementException(onlinePath.toStdString());
+    }
+
+    qDebug() << Q_FUNC_INFO << "FUSE read request:" << onlinePath;
+    auto cachedFile = cacheFile(onlinePath);
+    cachedFile->lastAccess = QDateTime::currentDateTime();
+
+
+    auto fh = cachedFile->fh;
+    auto offlinePath = cachedFile->offlinePath;
+    if (!fh) {
+        fh = QSharedPointer<QFile>(new QFile(offlinePath));
+        if (!fh->open(QIODevice::ReadWrite)) {
+            auto msg = QString("Could not open file (offline: " + offlinePath + "; online: " + onlinePath + " for reading");
+            qCritical() << Q_FUNC_INFO << msg;
+            throw VfsCacheException(msg.toStdString());
+        }
+    }
+
+    if (!fh->seek(offset)) {
+        auto msg = QString("Could not seek to offset in file (offline: " + offlinePath + "; online: " + onlinePath);
+        qCritical() << Q_FUNC_INFO << msg;
+        throw VfsCacheException(msg.toStdString());
+    }
+
+    return QString(fh->read(noBytes));
+}
+
+bool VfsCache::isFile(QString path)
+{
+    auto &dirListing = getDirListing(VfsUtils::getDirectory(path))->list;
+    auto fileName = VfsUtils::getFile(path);
+
+    return std::find_if(dirListing.cbegin(), dirListing.cend(), [&fileName](auto &item) {
+        return item->path == fileName
+            && (item->type == ItemType::ItemTypeFile || item->type == ItemType::ItemTypeSoftLink);
+    }) != dirListing.cend();
+}
+
+bool VfsCache::checkCacheFiles()
+{
+    auto curTime = QDateTime::QDateTime::currentDateTime();
+    QStringList toRemove;
+
+    for (auto &cacheItem : _cachedFiles) {
+        if (cacheItem->lastAccess.secsTo(curTime) > _cacheSecs)
+            toRemove.append(cacheItem->onlinePath);
+    }
+
+    for (auto &remItem : toRemove) {
+        qDebug() << Q_FUNC_INFO << "Removing file from cache:" << remItem;
+        _cachedFiles.remove(remItem);
+    }
+
+    return !toRemove.empty();
 }
 }

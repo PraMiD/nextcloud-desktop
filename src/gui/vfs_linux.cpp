@@ -126,7 +126,16 @@ int VfsLinux::readdir(std::string path, void *buf, fuse_fill_dir_t filler, off_t
 
 int VfsLinux::read(const char *c_path, char *buf, size_t size, off_t off, struct fuse_file_info *fi, struct fuse_context *)
 {
-    return -ENOENT;
+    try {
+        auto data = _cache->readFile(QString(c_path), off, size);
+        strncpy(buf, data.toUtf8().data(), size);
+
+        return data.length() > size ? size : data.length();
+    } catch (VfsCacheNoSuchElementException &e) {
+        // No such element
+        qWarning() << Q_FUNC_INFO << "File" << c_path << "does not exist";
+        return -ENOENT;
+    }
 }
 
 int VfsLinux::doGetattr(const char *c_path, struct stat *st)
@@ -229,6 +238,8 @@ void VfsLinux::mount()
         [this]() {
             qInfo() << Q_FUNC_INFO << "Mounting fuse FS/VFS at: " + this->_mountpath;
             fuse_loop(_fuseFs);
+
+            qInfo() << Q_FUNC_INFO << "Unmounting fuse FS/VFS at: " + this->_mountpath;
             fuse_unmount(this->_mountpath.toUtf8().constData(), _fuseChan);
             fuse_destroy(_fuseFs);
         });
