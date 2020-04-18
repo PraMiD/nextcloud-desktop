@@ -56,6 +56,7 @@ private:
     int getattr(std::string, struct stat *, struct fuse_context *);
     int readdir(std::string, void *, fuse_fill_dir_t, off_t, struct fuse_file_info *, struct fuse_context *);
     int read(const char *, char *, size_t, off_t, struct fuse_file_info *, struct fuse_context *);
+    int write(const char *, const char *, size_t, off_t, struct fuse_file_info *, struct fuse_context *);
 
     static bool fuse_initialized;
     static struct fuse_operations _ops;
@@ -66,6 +67,7 @@ private:
         struct fuse_file_info *);
     static int doRead(const char *, char *, size_t, off_t,
         struct fuse_file_info *);
+    static int doWrite(const char *, const char *, size_t, off_t, struct fuse_file_info *);
 };
 } // namespace OCC
 

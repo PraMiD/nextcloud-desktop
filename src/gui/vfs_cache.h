@@ -66,7 +66,7 @@ struct VfsCacheFile
     QDateTime download;
     QString onlinePath;
     QString offlinePath;
-    QSharedPointer<QFile> fh;
+    //QSharedPointer<QFile> fh;
 
     friend QDataStream &operator<<(QDataStream &out, const VfsCacheFile &cacheFile)
     {
@@ -153,7 +153,8 @@ public:
     ~VfsCache();
 
     QSharedPointer<OCC::DiscoveryDirectoryResult> getDirListing(QString);
-    const QString readFile(QString, off_t, size_t);
+    const QString readFile(const QString, off_t, size_t);
+    void writeFile(const QString, const QString, off_t);
 };
 }
 

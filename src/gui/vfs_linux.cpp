@@ -36,6 +36,7 @@ void VfsLinux::initFuseStatic()
     _ops.getattr = VfsLinux::doGetattr;
     _ops.readdir = VfsLinux::doReaddir;
     _ops.read = VfsLinux::doRead;
+    _ops.write = VfsLinux::doWrite;
 
     fuse_initialized = true;
 }
@@ -124,6 +125,18 @@ int VfsLinux::readdir(std::string path, void *buf, fuse_fill_dir_t filler, off_t
     return -err;
 }
 
+int VfsLinux::write(const char *c_path, const char *buf, size_t size, off_t off, struct fuse_file_info *, struct fuse_context *)
+{
+    try {
+        _cache->writeFile(QString(c_path), QString::fromStdString(std::string(buf, size)), off);
+        return size;
+    } catch (VfsCacheNoSuchElementException &e) {
+        // No such element
+        qWarning() << Q_FUNC_INFO << "File" << c_path << "does not exist";
+        return -ENOENT;
+    }
+}
+
 int VfsLinux::read(const char *c_path, char *buf, size_t size, off_t off, struct fuse_file_info *fi, struct fuse_context *)
 {
     try {
@@ -158,6 +171,13 @@ int VfsLinux::doRead(const char *c_path, char *buf, size_t size, off_t off, stru
 
     auto ctx = fuse_get_context();
     return static_cast<VfsLinux *>(ctx->private_data)->read(c_path, buf, size, off, fi, ctx);
+}
+int VfsLinux::doWrite(const char *c_path, const char *buf, size_t size, off_t off, struct fuse_file_info *fi)
+{
+    qDebug() << Q_FUNC_INFO;
+
+    auto ctx = fuse_get_context();
+    return static_cast<VfsLinux *>(ctx->private_data)->write(c_path, buf, size, off, fi, ctx);
 }
 
 VfsLinux::VfsLinux(QString &mountPath, QString &cachePath, AccountState *accState)

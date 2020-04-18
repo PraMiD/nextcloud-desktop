@@ -100,8 +100,6 @@ VfsCache::VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs)
     connect(_eng, &SyncEngine::syncError, this, &VfsCache::syncError);
     connect(_eng, &SyncEngine::itemCompleted, this, &VfsCache::engineItemProcessed);
 
-    buildExcludeList();
-
     _threadRunning = true;
     _cacheThread.setObjectName("VfsCacheThread");
     connect(&_cacheThread, &QThread::started,
@@ -301,7 +299,9 @@ void VfsCache::loadFileList(QString path)
         {
             QMutexLocker locker(&_fileListMut);
             emit loadFolderContent(path);
-            _updateCondVar.wait(&_fileListMut);
+            if (!_updateCondVar.wait(&_fileListMut, 3000)) {
+                qWarning() << Q_FUNC_INFO << "Timeout while loading file list";
+            }
         }
     } catch (VfsCacheNoSuchElementException &e) {
         qCritical() << Q_FUNC_INFO << "Path does not exist:" << e.what();
@@ -490,7 +490,7 @@ QSharedPointer<VfsCacheFile> VfsCache::cacheFile(QString onlinePath)
     return newFileInfo;
 }
 
-const QString VfsCache::readFile(QString onlinePath, off_t offset, size_t noBytes)
+const QString VfsCache::readFile(const QString onlinePath, off_t offset, size_t noBytes)
 {
     // Cache file (if not already cached)
     if (!isFile(onlinePath)) {
@@ -503,16 +503,16 @@ const QString VfsCache::readFile(QString onlinePath, off_t offset, size_t noByte
     cachedFile->lastAccess = QDateTime::currentDateTime();
 
 
-    auto fh = cachedFile->fh;
+    //auto fh = cachedFile->fh;
     auto offlinePath = cachedFile->offlinePath;
-    if (!fh) {
-        fh = QSharedPointer<QFile>(new QFile(offlinePath));
-        if (!fh->open(QIODevice::ReadWrite)) {
-            auto msg = QString("Could not open file (offline: " + offlinePath + "; online: " + onlinePath + " for reading");
-            qCritical() << Q_FUNC_INFO << msg;
-            throw VfsCacheException(msg.toStdString());
-        }
+    //if (!fh) {
+    auto fh = QSharedPointer<QFile>(new QFile(offlinePath));
+    if (!fh->open(QIODevice::ReadOnly)) {
+        auto msg = QString("Could not open file (offline: " + offlinePath + "; online: " + onlinePath + " for reading");
+        qCritical() << Q_FUNC_INFO << msg;
+        throw VfsCacheException(msg.toStdString());
     }
+    //}
 
     if (!fh->seek(offset)) {
         auto msg = QString("Could not seek to offset in file (offline: " + offlinePath + "; online: " + onlinePath);
@@ -520,7 +520,44 @@ const QString VfsCache::readFile(QString onlinePath, off_t offset, size_t noByte
         throw VfsCacheException(msg.toStdString());
     }
 
-    return QString(fh->read(noBytes));
+    auto data = QString(fh->read(noBytes));
+    fh->close();
+    return data;
+}
+
+void VfsCache::writeFile(const QString onlinePath, const QString data, off_t offset)
+{
+    // Cache file (if not already cached)
+    if (!isFile(onlinePath)) {
+        qCritical() << Q_FUNC_INFO << "FUSE requested unknown existing file:" << onlinePath;
+        throw VfsCacheNoSuchElementException(onlinePath.toStdString());
+    }
+
+    qDebug() << Q_FUNC_INFO << "FUSE write request:" << onlinePath;
+    auto cachedFile = cacheFile(onlinePath);
+    cachedFile->lastAccess = QDateTime::currentDateTime();
+
+
+    //auto fh = cachedFile->fh;
+    auto offlinePath = cachedFile->offlinePath;
+    //if (!fh) {
+    auto fh = QSharedPointer<QFile>(new QFile(offlinePath));
+    if (!fh->open(QIODevice::WriteOnly)) {
+        auto msg = QString("Could not open file (offline: " + offlinePath + "; online: " + onlinePath + " for writing");
+        qCritical() << Q_FUNC_INFO << msg;
+        throw VfsCacheException(msg.toStdString());
+    }
+    //}
+
+    if (!fh->seek(offset)) {
+        auto msg = QString("Could not seek to offset in file (offline: " + offlinePath + "; online: " + onlinePath);
+        qCritical() << Q_FUNC_INFO << msg;
+        throw VfsCacheException(msg.toStdString());
+    }
+
+    fh->write(data.toStdString().c_str(), data.length());
+    fh->close();
+    // Thread loop syncs the file
 }
 
 bool VfsCache::isFile(QString path)
