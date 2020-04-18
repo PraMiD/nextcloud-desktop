@@ -60,17 +60,27 @@ public:
     }
 };
 
-struct VfsCacheFile : public QObject
+struct VfsCacheFile
 {
-    Q_OBJECT
-
-public:
     QDateTime lastAccess;
     QDateTime download;
     QString onlinePath;
     QString offlinePath;
     QSharedPointer<QFile> fh;
+
+    friend QDataStream &operator<<(QDataStream &out, const VfsCacheFile &cacheFile)
+    {
+        out << cacheFile.lastAccess << cacheFile.download << cacheFile.onlinePath << cacheFile.offlinePath;
+        return out;
+    }
+
+    friend QDataStream &operator>>(QDataStream &in, VfsCacheFile &cacheFile)
+    {
+        in >> cacheFile.lastAccess >> cacheFile.download >> cacheFile.onlinePath >> cacheFile.offlinePath;
+        return in;
+    }
 };
+
 
 class VfsCache : public QObject
 {
@@ -79,6 +89,7 @@ class VfsCache : public QObject
 private:
     QPointer<AccountState> _accState;
     QString _cacheDir;
+    QString _metadataPath;
     QString _fileCacheDir;
     QThread _cacheThread;
     int _refreshTime;
@@ -101,6 +112,9 @@ private:
     QMap<QString, QPair<QSharedPointer<QMutex>, QSharedPointer<QWaitCondition>>> _waitForSyncFiles;
 
     bool _syncStarted;
+
+    void loadCacheState();
+    void storeCacheState();
 
     void updateCurFileList();
     void loadFileList(QString);

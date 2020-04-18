@@ -35,7 +35,7 @@ VfsCache::VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs)
     , _refreshTime(refreshTimeMs)
     , _dictWalker(accState->account())
     , _threadRunning(false)
-    , _cacheSecs(5)
+    , _cacheSecs(60)
 {
     // Check if the cache directory exists
     auto file_info = QFileInfo(this->_cacheDir);
@@ -74,6 +74,19 @@ VfsCache::VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs)
         throw VfsCacheException(msg.toUtf8().constData());
     }
 
+    QFileInfo cacheMetaData(file_info.absoluteFilePath() + "/cache.store");
+    _metadataPath = cacheMetaData.absoluteFilePath();
+    if (cacheMetaData.exists()) {
+        if (!cacheMetaData.isFile()) {
+            // Cache directory is a file..
+            auto msg = "Cache metadata path exists, but is no file: " + _metadataPath;
+            qCritical() << Q_FUNC_INFO << msg;
+            throw VfsCacheException(msg.toUtf8().constData());
+        }
+
+        loadCacheState();
+    }
+
     _dictWalker.setParent(this);
     connect(this, &VfsCache::loadFolderContent, &_dictWalker, &OCC::DiscoveryFolderFileList::doGetFolderContent);
     connect(&_dictWalker, &OCC::DiscoveryFolderFileList::gotDataSignal, this, &VfsCache::handleDirectoryUpdate);
@@ -87,7 +100,6 @@ VfsCache::VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs)
     connect(_eng, &SyncEngine::syncError, this, &VfsCache::syncError);
     connect(_eng, &SyncEngine::itemCompleted, this, &VfsCache::engineItemProcessed);
 
-    // TODO: Load cache!
     buildExcludeList();
 
     _threadRunning = true;
@@ -389,8 +401,8 @@ void VfsCache::buildExcludeList()
         toVisitPaths = newVisitPaths;
     }
 
-    qDebug() << Q_FUNC_INFO << _excludedItems;
-    qDebug() << Q_FUNC_INFO << _cachedFiles.keys();
+    storeCacheState();
+
     // TODO: Ensure that file is synced before it is deleted
     _journal->setSelectiveSyncList(SyncJournalDb::SelectiveSyncBlackList, _excludedItems);
 }
@@ -538,5 +550,54 @@ bool VfsCache::checkCacheFiles()
     }
 
     return !toRemove.empty();
+}
+
+void VfsCache::loadCacheState()
+{
+    qDebug() << "Load cache file: " << _metadataPath;
+
+    QFile cacheStateFile(_metadataPath);
+
+    if (!cacheStateFile.exists()) {
+        QString msg = "Cannot read cache state, file does not exist: " + _metadataPath;
+        qCritical() << msg;
+        throw VfsCacheException(msg.toStdString());
+    }
+
+    if (!cacheStateFile.open(QIODevice::ReadOnly)) {
+        QString msg = "Cannot read cache state, cannot open file: " + _metadataPath;
+        qCritical() << msg;
+        throw VfsCacheException(msg.toStdString());
+    }
+
+    QList<VfsCacheFile> cacheFileList;
+    QDataStream instream(&cacheStateFile);
+    instream >> cacheFileList;
+
+    for (auto &cacheFile : cacheFileList)
+        _cachedFiles.insert(cacheFile.offlinePath, QSharedPointer<VfsCacheFile>(new VfsCacheFile(cacheFile)));
+
+    cacheStateFile.close();
+}
+
+void VfsCache::storeCacheState()
+{
+    qDebug() << "Store cache file: " << _metadataPath;
+
+    QFile cacheStateFile(_metadataPath);
+
+    if (!cacheStateFile.open(QIODevice::WriteOnly)) {
+        QString msg = "Cannot write cache state, cannot open file: " + _metadataPath;
+        qCritical() << msg;
+        throw VfsCacheException(msg.toStdString());
+    }
+
+    QList<VfsCacheFile> cacheFileList;
+    for (auto cacheFile : _cachedFiles.values())
+        cacheFileList.append(*cacheFile);
+    QDataStream outstream(&cacheStateFile);
+    outstream << cacheFileList;
+
+    cacheStateFile.close();
 }
 }
