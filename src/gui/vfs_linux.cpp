@@ -174,7 +174,7 @@ int VfsLinux::doRead(const char *c_path, char *buf, size_t size, off_t off, stru
 }
 int VfsLinux::doWrite(const char *c_path, const char *buf, size_t size, off_t off, struct fuse_file_info *fi)
 {
-    qDebug() << Q_FUNC_INFO;
+    qDebug() << Q_FUNC_INFO << c_path << size << off;
 
     auto ctx = fuse_get_context();
     return static_cast<VfsLinux *>(ctx->private_data)->write(c_path, buf, size, off, fi, ctx);

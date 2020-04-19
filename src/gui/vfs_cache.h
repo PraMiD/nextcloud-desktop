@@ -111,6 +111,9 @@ private:
 
     QMap<QString, QPair<QSharedPointer<QMutex>, QSharedPointer<QWaitCondition>>> _waitForSyncFiles;
 
+    // Used to protect file updates (read, write) and sync operations
+    // -> Recursive mutex
+    QMutex _syncOpRunning;
     bool _syncStarted;
 
     void loadCacheState();

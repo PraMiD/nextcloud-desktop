@@ -36,6 +36,7 @@ VfsCache::VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs)
     , _dictWalker(accState->account())
     , _threadRunning(false)
     , _cacheSecs(60)
+    , _syncOpRunning(QMutex::Recursive)
 {
     // Check if the cache directory exists
     auto file_info = QFileInfo(this->_cacheDir);
@@ -111,15 +112,17 @@ VfsCache::VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs)
             // Loop
             _syncStarted = false;
             while (_threadRunning) {
-                qDebug() << Q_FUNC_INFO << "Refresh the directory listings of all currently cached directories";
-                _eng->setLocalDiscoveryOptions(LocalDiscoveryStyle::FilesystemOnly);
+                if (_accState->isConnected()) {
+                    qDebug() << Q_FUNC_INFO << "Refresh the directory listings of all currently cached directories";
+                    _eng->setLocalDiscoveryOptions(LocalDiscoveryStyle::FilesystemOnly);
 
 
-                updateCurFileList();
-                if (checkCacheFiles()) // Remote discovery if files were removed from cache
-                    _eng->journal()->forceRemoteDiscoveryNextSync();
-                buildExcludeList();
-                doSync();
+                    updateCurFileList();
+                    if (checkCacheFiles()) // Remote discovery if files were removed from cache
+                        _eng->journal()->forceRemoteDiscoveryNextSync();
+                    buildExcludeList();
+                    doSync();
+                }
                 _cacheThread.msleep(_refreshTime);
             }
         });
@@ -128,6 +131,7 @@ VfsCache::VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs)
 
 void VfsCache::doSync()
 {
+    QMutexLocker locker(&_syncOpRunning);
     if (!_eng->isSyncRunning() && !_syncStarted) {
         if (_accState->isConnected()) {
             setSyncOptions();
@@ -492,13 +496,16 @@ QSharedPointer<VfsCacheFile> VfsCache::cacheFile(QString onlinePath)
 
 const QString VfsCache::readFile(const QString onlinePath, off_t offset, size_t noBytes)
 {
-    // Cache file (if not already cached)
     if (!isFile(onlinePath)) {
         qCritical() << Q_FUNC_INFO << "FUSE requested unknown existing file:" << onlinePath;
         throw VfsCacheNoSuchElementException(onlinePath.toStdString());
     }
 
-    qDebug() << Q_FUNC_INFO << "FUSE read request:" << onlinePath;
+    QMutexLocker locker(&_syncOpRunning); // Reentrant -> sync wont block
+    qDebug()
+        << Q_FUNC_INFO << "FUSE read request:" << onlinePath;
+
+    // Cache file (if not already cached)
     auto cachedFile = cacheFile(onlinePath);
     cachedFile->lastAccess = QDateTime::currentDateTime();
 
@@ -507,7 +514,7 @@ const QString VfsCache::readFile(const QString onlinePath, off_t offset, size_t 
     auto offlinePath = cachedFile->offlinePath;
     //if (!fh) {
     auto fh = QSharedPointer<QFile>(new QFile(offlinePath));
-    if (!fh->open(QIODevice::ReadOnly)) {
+    if (!fh->open(QIODevice::ReadOnly | QIODevice::Unbuffered)) {
         auto msg = QString("Could not open file (offline: " + offlinePath + "; online: " + onlinePath + " for reading");
         qCritical() << Q_FUNC_INFO << msg;
         throw VfsCacheException(msg.toStdString());
@@ -527,13 +534,15 @@ const QString VfsCache::readFile(const QString onlinePath, off_t offset, size_t 
 
 void VfsCache::writeFile(const QString onlinePath, const QString data, off_t offset)
 {
-    // Cache file (if not already cached)
     if (!isFile(onlinePath)) {
         qCritical() << Q_FUNC_INFO << "FUSE requested unknown existing file:" << onlinePath;
         throw VfsCacheNoSuchElementException(onlinePath.toStdString());
     }
 
+    QMutexLocker locker(&_syncOpRunning); // Reentrant -> sync wont block
     qDebug() << Q_FUNC_INFO << "FUSE write request:" << onlinePath;
+
+    // Cache file if not already cached
     auto cachedFile = cacheFile(onlinePath);
     cachedFile->lastAccess = QDateTime::currentDateTime();
 
@@ -542,7 +551,7 @@ void VfsCache::writeFile(const QString onlinePath, const QString data, off_t off
     auto offlinePath = cachedFile->offlinePath;
     //if (!fh) {
     auto fh = QSharedPointer<QFile>(new QFile(offlinePath));
-    if (!fh->open(QIODevice::WriteOnly)) {
+    if (!fh->open(QIODevice::ReadWrite | QIODevice::Unbuffered)) { // RW for seeking ;)
         auto msg = QString("Could not open file (offline: " + offlinePath + "; online: " + onlinePath + " for writing");
         qCritical() << Q_FUNC_INFO << msg;
         throw VfsCacheException(msg.toStdString());
@@ -556,6 +565,7 @@ void VfsCache::writeFile(const QString onlinePath, const QString data, off_t off
     }
 
     fh->write(data.toStdString().c_str(), data.length());
+    fh->flush();
     fh->close();
     // Thread loop syncs the file
 }
@@ -577,14 +587,20 @@ bool VfsCache::checkCacheFiles()
     QStringList toRemove;
 
     for (auto &cacheItem : _cachedFiles) {
-        if (cacheItem->lastAccess.secsTo(curTime) > _cacheSecs)
+        if (cacheItem->lastAccess.secsTo(curTime) > _cacheSecs) {
+            qDebug() << Q_FUNC_INFO << "Delete from cache (" << cacheItem->lastAccess.secsTo(curTime) << ")" << cacheItem->onlinePath;
             toRemove.append(cacheItem->onlinePath);
+        } else {
+            qDebug() << Q_FUNC_INFO << "Keep in cache (" << cacheItem->lastAccess.secsTo(curTime) << ")" << cacheItem->onlinePath;
+        }
     }
 
     for (auto &remItem : toRemove) {
         qDebug() << Q_FUNC_INFO << "Removing file from cache:" << remItem;
         _cachedFiles.remove(remItem);
     }
+
+    qDebug() << _cachedFiles.keys();
 
     return !toRemove.empty();
 }
@@ -612,7 +628,7 @@ void VfsCache::loadCacheState()
     instream >> cacheFileList;
 
     for (auto &cacheFile : cacheFileList)
-        _cachedFiles.insert(cacheFile.offlinePath, QSharedPointer<VfsCacheFile>(new VfsCacheFile(cacheFile)));
+        _cachedFiles.insert(cacheFile.onlinePath, QSharedPointer<VfsCacheFile>(new VfsCacheFile(cacheFile)));
 
     cacheStateFile.close();
 }
@@ -623,7 +639,7 @@ void VfsCache::storeCacheState()
 
     QFile cacheStateFile(_metadataPath);
 
-    if (!cacheStateFile.open(QIODevice::WriteOnly)) {
+    if (!cacheStateFile.open(QIODevice::WriteOnly | QIODevice::Unbuffered)) {
         QString msg = "Cannot write cache state, cannot open file: " + _metadataPath;
         qCritical() << msg;
         throw VfsCacheException(msg.toStdString());
