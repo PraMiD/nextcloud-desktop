@@ -21,6 +21,7 @@
 #include <QMutex>
 #include <QWaitCondition>
 #include <QSharedPointer>
+#include <QStringList>
 
 #include <exception>
 #include <string>
@@ -60,23 +61,32 @@ public:
     }
 };
 
+struct VfsCacheFileInfo
+{
+    QString onlinePath;
+    QDateTime accessTime;
+    QDateTime modTime;
+    ItemType type;
+    off_t size;
+};
+
 struct VfsCacheFile
 {
     QDateTime lastAccess;
+    QDateTime lastModification;
     QDateTime download;
     QString onlinePath;
     QString offlinePath;
-    //QSharedPointer<QFile> fh;
 
     friend QDataStream &operator<<(QDataStream &out, const VfsCacheFile &cacheFile)
     {
-        out << cacheFile.lastAccess << cacheFile.download << cacheFile.onlinePath << cacheFile.offlinePath;
+        out << cacheFile.lastAccess << cacheFile.lastModification << cacheFile.download << cacheFile.onlinePath << cacheFile.offlinePath;
         return out;
     }
 
     friend QDataStream &operator>>(QDataStream &in, VfsCacheFile &cacheFile)
     {
-        in >> cacheFile.lastAccess >> cacheFile.download >> cacheFile.onlinePath >> cacheFile.offlinePath;
+        in >> cacheFile.lastAccess >> cacheFile.lastModification >> cacheFile.download >> cacheFile.onlinePath >> cacheFile.offlinePath;
         return in;
     }
 };
@@ -116,6 +126,9 @@ private:
     QMutex _syncOpRunning;
     bool _syncStarted;
 
+    // Used to protect operations that modify/access the cache
+    QMutex _cacheOpRunning;
+
     void loadCacheState();
     void storeCacheState();
 
@@ -137,6 +150,9 @@ private:
     bool canIgnoreDir(QString path);
 
     bool isFile(QString path);
+    bool isDir(QString path);
+    QSharedPointer<OCC::DiscoveryDirectoryResult> getIntDirInfo(QString);
+    VfsCacheFileInfo fillFileInfo(const std::unique_ptr<csync_file_stat_t> &, QString);
 
 
 private slots:
@@ -155,8 +171,11 @@ public:
     VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs = 10000);
     ~VfsCache();
 
-    QSharedPointer<OCC::DiscoveryDirectoryResult> getDirListing(QString);
+    QStringList getDirListing(QString);
+    VfsCacheFileInfo getFileInfo(QString);
+    void cacheNewItem(const QString, const QString, bool);
     const QString readFile(const QString, off_t, size_t);
+    void createDirectory(const QString onlinePath);
     void writeFile(const QString, const QString, off_t);
 };
 }

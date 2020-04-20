@@ -37,6 +37,7 @@ void VfsLinux::initFuseStatic()
     _ops.readdir = VfsLinux::doReaddir;
     _ops.read = VfsLinux::doRead;
     _ops.write = VfsLinux::doWrite;
+    _ops.mkdir = VfsLinux::doMkdir;
 
     fuse_initialized = true;
 }
@@ -61,14 +62,15 @@ int VfsLinux::getattr(std::string path, struct stat *st, struct fuse_context *)
             auto qpath = QString::fromStdString(path);
             auto dir = VfsUtils::getDirectory(qpath);
             auto file = VfsUtils::getFile(qpath);
-            auto data = _cache->getDirListing(dir);
 
             err = ENOENT;
-            for (auto &f : data->list) {
-                if (f->path == file) {
+            for (auto &f : _cache->getDirListing(dir)) {
+                if (f == file) {
                     err = 0;
+                    auto fi = _cache->getFileInfo(qpath);
+
                     // File found
-                    switch (f->type) {
+                    switch (fi.type) {
                     case ItemType::ItemTypeSkip:
                         err = ENOENT;
                     case ItemType::ItemTypeDirectory:
@@ -90,11 +92,11 @@ int VfsLinux::getattr(std::string path, struct stat *st, struct fuse_context *)
                         st->st_nlink = 2;
                         st->st_uid = _mountOwner;
                         st->st_gid = _mountGroup;
-                        st->st_atime = f->modtime;
-                        st->st_mtime = f->modtime;
-                        st->st_size = f->size;
+                        st->st_atime = fi.accessTime.toSecsSinceEpoch();
+                        st->st_mtime = fi.modTime.toSecsSinceEpoch();
+                        st->st_size = fi.size;
                         st->st_blksize = 1;
-                        st->st_blocks = f->size / 512 + ((f->size % 512) > 1);
+                        st->st_blocks = fi.size / 512 + ((fi.size % 512) > 1);
                     }
                 }
             }
@@ -114,9 +116,8 @@ int VfsLinux::readdir(std::string path, void *buf, fuse_fill_dir_t filler, off_t
     filler(buf, "..", NULL, 0);
 
     try {
-        auto data = _cache->getDirListing(QString::fromStdString(path));
-        for (auto &e : data->list)
-            filler(buf, e->path, NULL, 0);
+        for (auto &e : _cache->getDirListing(QString::fromStdString(path)))
+            filler(buf, e.toStdString().c_str(), NULL, 0);
         err = 0;
     } catch (VfsCacheNoSuchElementException &e) {
         // No such element
@@ -134,6 +135,24 @@ int VfsLinux::write(const char *c_path, const char *buf, size_t size, off_t off,
         // No such element
         qWarning() << Q_FUNC_INFO << "File" << c_path << "does not exist";
         return -ENOENT;
+    } catch (VfsCacheException &e) {
+        qCritical() << Q_FUNC_INFO << "Cache-internal error:" << e.what();
+        return -ENOENT;
+    }
+}
+
+int VfsLinux::mkdir(const char *c_path, mode_t mode, struct fuse_context *)
+{
+    try {
+        _cache->createDirectory(QString(c_path));
+        return 0;
+    } catch (VfsCacheNoSuchElementException &e) {
+        // No such element
+        qWarning() << Q_FUNC_INFO << "File" << c_path << "does not exist";
+        return -ENOENT;
+    } catch (VfsCacheException &e) {
+        qCritical() << Q_FUNC_INFO << "Cache-internal error:" << e.what();
+        return -ENOENT;
     }
 }
 
@@ -147,6 +166,9 @@ int VfsLinux::read(const char *c_path, char *buf, size_t size, off_t off, struct
     } catch (VfsCacheNoSuchElementException &e) {
         // No such element
         qWarning() << Q_FUNC_INFO << "File" << c_path << "does not exist";
+        return -ENOENT;
+    } catch (VfsCacheException &e) {
+        qCritical() << Q_FUNC_INFO << "Cache-internal error:" << e.what();
         return -ENOENT;
     }
 }
@@ -178,6 +200,13 @@ int VfsLinux::doWrite(const char *c_path, const char *buf, size_t size, off_t of
 
     auto ctx = fuse_get_context();
     return static_cast<VfsLinux *>(ctx->private_data)->write(c_path, buf, size, off, fi, ctx);
+}
+int VfsLinux::doMkdir(const char *c_path, mode_t mode)
+{
+    qDebug() << Q_FUNC_INFO << c_path << mode;
+
+    auto ctx = fuse_get_context();
+    return static_cast<VfsLinux *>(ctx->private_data)->mkdir(c_path, mode, ctx);
 }
 
 VfsLinux::VfsLinux(QString &mountPath, QString &cachePath, AccountState *accState)
