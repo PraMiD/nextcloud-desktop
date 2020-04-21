@@ -24,7 +24,11 @@ QString VfsUtils::getDirectory(QString path)
     if (lastSep == -1)
         return "/";
 
-    return path.left(lastSep + 1);
+    auto dir = path.left(lastSep + 1);
+    while (dir.endsWith("/") && dir.length() > 1)
+        dir.chop(1);
+
+    return dir;
 }
 
 QString VfsUtils::getFile(QString path)

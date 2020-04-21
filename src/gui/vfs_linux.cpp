@@ -38,6 +38,7 @@ void VfsLinux::initFuseStatic()
     _ops.read = VfsLinux::doRead;
     _ops.write = VfsLinux::doWrite;
     _ops.mkdir = VfsLinux::doMkdir;
+    _ops.rmdir = VfsLinux::doRmdir;
 
     fuse_initialized = true;
 }
@@ -156,6 +157,24 @@ int VfsLinux::mkdir(const char *c_path, mode_t mode, struct fuse_context *)
     }
 }
 
+int VfsLinux::rmdir(const char *c_path, struct fuse_context *)
+{
+    try {
+        auto qpath = QString(c_path);
+        if (qpath == "/")
+            return -EACCES;
+        _cache->removeDirectory(qpath);
+        return 0;
+    } catch (VfsCacheNoSuchElementException &e) {
+        // No such element
+        qWarning() << Q_FUNC_INFO << "File" << c_path << "does not exist";
+        return -ENOENT;
+    } catch (VfsCacheException &e) {
+        qCritical() << Q_FUNC_INFO << "Cache-internal error:" << e.what();
+        return -ENOENT;
+    }
+}
+
 int VfsLinux::read(const char *c_path, char *buf, size_t size, off_t off, struct fuse_file_info *fi, struct fuse_context *)
 {
     try {
@@ -207,6 +226,14 @@ int VfsLinux::doMkdir(const char *c_path, mode_t mode)
 
     auto ctx = fuse_get_context();
     return static_cast<VfsLinux *>(ctx->private_data)->mkdir(c_path, mode, ctx);
+}
+
+int VfsLinux::doRmdir(const char *c_path)
+{
+    qDebug() << Q_FUNC_INFO << c_path;
+
+    auto ctx = fuse_get_context();
+    return static_cast<VfsLinux *>(ctx->private_data)->rmdir(c_path, ctx);
 }
 
 VfsLinux::VfsLinux(QString &mountPath, QString &cachePath, AccountState *accState)

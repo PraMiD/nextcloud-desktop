@@ -36,8 +36,8 @@ VfsCache::VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs)
     , _dictWalker(accState->account())
     , _threadRunning(false)
     , _cacheSecs(60)
-    , _syncOpRunning(QMutex::Recursive)
     , _cacheOpRunning(QMutex::Recursive)
+    , _syncOpRunning(QMutex::Recursive)
 {
     // Check if the cache directory exists
     auto file_info = QFileInfo(this->_cacheDir);
@@ -122,7 +122,8 @@ VfsCache::VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs)
                     if (checkCacheFiles()) // Remote discovery if files were removed from cache
                         _eng->journal()->forceRemoteDiscoveryNextSync();
                     buildExcludeList();
-                    doSync();
+                    if (_syncOpRunning.try_lock())
+                        doSync(); // Another sync is running -> fine
                 }
                 _cacheThread.msleep(_refreshTime);
             }
@@ -130,18 +131,23 @@ VfsCache::VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs)
     _cacheThread.start();
 }
 
-void VfsCache::doSync()
+bool VfsCache::doSync()
 {
-    QMutexLocker locker(&_syncOpRunning);
+    // Parent must hold _syncOpRunning
     if (!_eng->isSyncRunning() && !_syncStarted) {
         if (_accState->isConnected()) {
             setSyncOptions();
             _syncStarted = true;
             QMetaObject::invokeMethod(_eng, "startSync", Qt::QueuedConnection);
+            return true;
         } else {
             qWarning() << Q_FUNC_INFO << "Not connected!";
         }
+    } else {
+        qDebug() << Q_FUNC_INFO << "Sync already running";
     }
+
+    return false;
 }
 
 void VfsCache::doSyncForFile(QString path)
@@ -151,11 +157,20 @@ void VfsCache::doSyncForFile(QString path)
     QSharedPointer<QWaitCondition> waitCond(new QWaitCondition());
     QPair<QSharedPointer<QMutex>, QSharedPointer<QWaitCondition>> syncPair(mut, waitCond);
 
-    _waitForSyncFiles.insert(path, syncPair);
+    {
+        mut->lock();
+        _waitForSyncFiles.insert(path, syncPair);
+        _syncOpRunning.lock();
+        while (!doSync()) {
+            _syncOpRunning.unlock();
+            mut->unlock();
 
-    QMutexLocker locker(mut.data());
-    doSync();
-    waitCond->wait(mut.data());
+            QThread::currentThread()->msleep(100);
+            _syncOpRunning.lock();
+            mut->lock();
+        }
+        waitCond->wait(mut.data());
+    }
     qDebug() << Q_FUNC_INFO << "File" << path << "processed";
 
     _waitForSyncFiles.remove(path);
@@ -211,6 +226,7 @@ void VfsCache::engineItemProcessed(const SyncFileItemPtr &item)
 {
     auto file = QString("/" + item->_file);
 
+    qDebug() << Q_FUNC_INFO << "Keys:" << _waitForSyncFiles.keys() << "and current file" << file;
     if (_waitForSyncFiles.contains(file)) {
         qDebug() << Q_FUNC_INFO << "Processing wait file:" << file;
         auto mut = _waitForSyncFiles.value(file).first;
@@ -287,6 +303,7 @@ void VfsCache::syncFinished(bool success)
 {
     qInfo() << Q_FUNC_INFO << "Sync finished with result:" << success;
     _syncStarted = false;
+    _syncOpRunning.unlock();
 }
 
 void VfsCache::updateCurFileList()
@@ -307,6 +324,12 @@ void VfsCache::loadFileList(QString path)
             if (!_updateCondVar.wait(&_fileListMut, 3000)) {
                 qWarning() << Q_FUNC_INFO << "Timeout while loading file list";
             }
+
+            QStringList dirListing;
+            for (auto &intFi : _fileMap.value(path)->list)
+                dirListing.append(intFi->path);
+
+            qDebug() << "New folder content of" << path << ":" << dirListing;
         }
     } catch (VfsCacheNoSuchElementException &e) {
         qCritical() << Q_FUNC_INFO << "Path does not exist:" << e.what();
@@ -317,10 +340,9 @@ void VfsCache::loadFileList(QString path)
 
 void VfsCache::handleDirectoryUpdate(DiscoveryDirectoryResult *res)
 {
-    qDebug()
-        << Q_FUNC_INFO << "File update returned";
-
     QString path = res->path;
+    qDebug()
+        << Q_FUNC_INFO << "File update returned:" << res->path;
     {
         QMutexLocker locker(&_fileListMut);
 
@@ -460,6 +482,8 @@ void VfsCache::buildExcludeList()
 
     storeCacheState();
 
+    qDebug() << Q_FUNC_INFO << "Excluded items:" << _excludedItems;
+
     // TODO: Ensure that file is synced before it is deleted
     _journal->setSelectiveSyncList(SyncJournalDb::SelectiveSyncBlackList, _excludedItems);
 }
@@ -513,11 +537,11 @@ bool VfsCache::canIgnoreDir(QString path)
     return match == cachedPaths.cend();
 }
 
-void VfsCache::cacheNewItem(const QString dirOnlinePath, const QString elemName, bool isDir)
+void VfsCache::cacheNewItem(const QString parentDirOnlinePath, const QString elemName, bool isDir)
 {
-    qDebug() << Q_FUNC_INFO << "Cache new element '" << elemName << "' at path:" << dirOnlinePath;
+    qDebug() << Q_FUNC_INFO << "Cache new element " << elemName << "at path:" << parentDirOnlinePath;
     QSharedPointer<VfsCacheFile> newFileInfo = QSharedPointer<VfsCacheFile>(new VfsCacheFile());
-    auto onlinePath = VfsUtils::pathJoin(dirOnlinePath, elemName);
+    auto onlinePath = VfsUtils::pathJoin(parentDirOnlinePath, elemName);
     newFileInfo->onlinePath = onlinePath;
     newFileInfo->offlinePath = VfsUtils::pathJoin(_fileCacheDir, onlinePath.right(onlinePath.length() - 1));
     newFileInfo->download = newFileInfo->lastAccess = newFileInfo->lastModification = QDateTime::currentDateTime();
@@ -526,10 +550,19 @@ void VfsCache::cacheNewItem(const QString dirOnlinePath, const QString elemName,
         _cachedFiles.insert(onlinePath, newFileInfo);
         buildExcludeList(); // Update ignore list -> Does not affect the new file as it is not known to the cloud
 
+        // Ensure that the parent directory is created locally
+        // -> Sync if it is not currently available
+        QDir parentDir(VfsUtils::getDirectory(newFileInfo->offlinePath));
+        if (!parentDir.exists()) {
+            _eng->journal()
+                ->forceRemoteDiscoveryNextSync();
+            doSyncForFile(parentDirOnlinePath);
+            qDebug() << Q_FUNC_INFO << "Cached" << parentDirOnlinePath << "locally";
+        }
 
         // Create the new element
+        qDebug() << "Create new" << (isDir ? "directory" : "file") << "called" << elemName << "at cache path" << parentDir.absolutePath();
         if (isDir) {
-            QDir parentDir(VfsUtils::getDirectory(newFileInfo->offlinePath));
             parentDir.mkdir(elemName);
         } else {
             QFile newFile(newFileInfo->offlinePath);
@@ -539,13 +572,14 @@ void VfsCache::cacheNewItem(const QString dirOnlinePath, const QString elemName,
         }
 
 
-        // Blocks until the file is processed by the engine
+        // Blocks until the new item is processed by the engine
         _eng->journal()
             ->forceRemoteDiscoveryNextSync();
         doSyncForFile(onlinePath);
 
         // Load the new directory/path into our list of remote items
-        loadFileList(dirOnlinePath);
+        qDebug() << Q_FUNC_INFO << "Load file list for directory" << parentDirOnlinePath;
+        loadFileList(parentDirOnlinePath); // I'm sorry for this..
     }
 }
 
@@ -599,7 +633,6 @@ const QString VfsCache::readFile(const QString onlinePath, off_t offset, size_t 
         throw VfsCacheNoSuchElementException(onlinePath.toStdString());
     }
 
-    QMutexLocker locker(&_syncOpRunning); // Reentrant -> sync wont block
     qDebug()
         << Q_FUNC_INFO << "FUSE read request:" << onlinePath;
 
@@ -635,8 +668,43 @@ void VfsCache::createDirectory(const QString onlinePath)
     auto dirName = VfsUtils::getFile(onlinePath);
     auto parentDir = VfsUtils::getDirectory(onlinePath);
 
-    qDebug() << Q_FUNC_INFO << "Create directory '" << dirName << "' in:" << parentDir;
+    qDebug() << Q_FUNC_INFO << "Create directory" << dirName << "in:" << parentDir;
     cacheNewItem(parentDir, dirName, true);
+}
+
+void VfsCache::removeDirectory(const QString onlinePath)
+{
+    auto dirName = VfsUtils::getFile(onlinePath);
+
+    if (onlinePath == "/") {
+        auto msg = "Cannot remove root directory";
+        qDebug() << Q_FUNC_INFO << msg;
+        throw VfsCacheException(msg);
+    }
+
+    qDebug() << Q_FUNC_INFO << "Removing directory '" << dirName << "' in:" << VfsUtils::getDirectory(onlinePath);
+
+    auto cacheFileInfo = cacheFile(onlinePath); // Ensure that changes are synced!
+    QDir parentDir = QDir(VfsUtils::getDirectory(cacheFileInfo->offlinePath));
+    parentDir.rmdir(dirName);
+
+    {
+        qDebug() << Q_FUNC_INFO << "A";
+        QMutexLocker locker(&_cacheOpRunning);
+        qDebug() << Q_FUNC_INFO << "B";
+        _eng->journal()->forceRemoteDiscoveryNextSync();
+        doSyncForFile(onlinePath);
+        qDebug() << Q_FUNC_INFO << "C";
+
+        // Remove from cache -> File is removed
+        _cachedFiles.remove(onlinePath);
+        buildExcludeList();
+        qDebug() << Q_FUNC_INFO << "D";
+
+        // Sync file list with remote
+        loadFileList(VfsUtils::getDirectory(onlinePath));
+        qDebug() << Q_FUNC_INFO << "E";
+    }
 }
 
 void VfsCache::writeFile(const QString onlinePath, const QString data, off_t offset)
@@ -646,7 +714,6 @@ void VfsCache::writeFile(const QString onlinePath, const QString data, off_t off
         throw VfsCacheNoSuchElementException(onlinePath.toStdString());
     }
 
-    QMutexLocker locker(&_syncOpRunning); // Reentrant -> sync wont block
     qDebug() << Q_FUNC_INFO << "FUSE write request:" << onlinePath;
 
     // Cache file if not already cached

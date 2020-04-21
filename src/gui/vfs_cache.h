@@ -136,9 +136,10 @@ private:
     void loadFileList(QString);
 
     QSharedPointer<VfsCacheFile> cacheFile(QString);
+    void cacheNewItem(const QString, const QString, bool);
 
     void setSyncOptions();
-    void doSync();
+    bool doSync();
     void doSyncForFile(QString path);
 
     void buildExcludeList();
@@ -173,9 +174,9 @@ public:
 
     QStringList getDirListing(QString);
     VfsCacheFileInfo getFileInfo(QString);
-    void cacheNewItem(const QString, const QString, bool);
     const QString readFile(const QString, off_t, size_t);
     void createDirectory(const QString onlinePath);
+    void removeDirectory(const QString onlinePath);
     void writeFile(const QString, const QString, off_t);
 };
 }
