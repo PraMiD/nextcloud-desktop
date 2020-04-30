@@ -537,9 +537,13 @@ bool VfsCache::canIgnoreDir(QString path)
     return match == cachedPaths.cend();
 }
 
-void VfsCache::cacheNewItem(const QString parentDirOnlinePath, const QString elemName, bool isDir)
+bool VfsCache::createItem(const QString parentDirOnlinePath, const QString elemName, bool isDir)
 {
     qDebug() << Q_FUNC_INFO << "Cache new element " << elemName << "at path:" << parentDirOnlinePath;
+
+    if (!this->isDir(parentDirOnlinePath))
+        throw VfsCacheNoSuchElementException(parentDirOnlinePath.toStdString());
+
     QSharedPointer<VfsCacheFile> newFileInfo = QSharedPointer<VfsCacheFile>(new VfsCacheFile());
     auto onlinePath = VfsUtils::pathJoin(parentDirOnlinePath, elemName);
     newFileInfo->onlinePath = onlinePath;
@@ -562,14 +566,20 @@ void VfsCache::cacheNewItem(const QString parentDirOnlinePath, const QString ele
 
         // Create the new element
         qDebug() << "Create new" << (isDir ? "directory" : "file") << "called" << elemName << "at cache path" << parentDir.absolutePath();
+        bool created = false;
         if (isDir) {
-            parentDir.mkdir(elemName);
+            created = parentDir.mkdir(elemName);
         } else {
             QFile newFile(newFileInfo->offlinePath);
-            newFile.open(QIODevice::ReadWrite);
-            newFile.flush();
-            newFile.close();
+            if (newFile.open(QIODevice::ReadWrite)) {
+                created = true;
+                newFile.flush();
+                newFile.close();
+            }
         }
+
+        if (!created)
+            throw VfsCacheOpNotSuccessfulException(EACCES);
 
 
         // Blocks until the new item is processed by the engine
@@ -581,6 +591,8 @@ void VfsCache::cacheNewItem(const QString parentDirOnlinePath, const QString ele
         qDebug() << Q_FUNC_INFO << "Load file list for directory" << parentDirOnlinePath;
         loadFileList(parentDirOnlinePath); // I'm sorry for this..
     }
+
+    return true;
 }
 
 QSharedPointer<VfsCacheFile> VfsCache::cacheFile(QString onlinePath)
@@ -620,8 +632,7 @@ QSharedPointer<VfsCacheFile> VfsCache::cacheFile(QString onlinePath)
     }
 
 
-    // TODO: Handle symlinks correctly: Do we have to follow the link or is this
-    //          done by the server
+    // TODO: Handle symlinks correctly: Do we have to follow the link or is this done by the server?
 
     return newFileInfo;
 }
@@ -669,42 +680,77 @@ void VfsCache::createDirectory(const QString onlinePath)
     auto parentDir = VfsUtils::getDirectory(onlinePath);
 
     qDebug() << Q_FUNC_INFO << "Create directory" << dirName << "in:" << parentDir;
-    cacheNewItem(parentDir, dirName, true);
+    createItem(parentDir, dirName, true);
+}
+
+void VfsCache::createFile(const QString onlinePath)
+{
+    auto fileName = VfsUtils::getFile(onlinePath);
+    auto parentDir = VfsUtils::getDirectory(onlinePath);
+
+    qDebug() << Q_FUNC_INFO << "Create file" << fileName << "in:" << parentDir;
+    createItem(parentDir, fileName, false);
 }
 
 void VfsCache::removeDirectory(const QString onlinePath)
 {
     auto dirName = VfsUtils::getFile(onlinePath);
+    auto parentDir = VfsUtils::getDirectory(onlinePath);
 
-    if (onlinePath == "/") {
+    qDebug() << Q_FUNC_INFO << "Remove directory" << dirName << "in:" << parentDir;
+    removeItem(parentDir, dirName, true);
+}
+
+void VfsCache::removeFile(const QString onlinePath)
+{
+    auto fileName = VfsUtils::getFile(onlinePath);
+    auto parentDir = VfsUtils::getDirectory(onlinePath);
+
+    qDebug() << Q_FUNC_INFO << "Remove file" << fileName << "in:" << parentDir;
+    removeItem(parentDir, fileName, false);
+}
+
+bool VfsCache::removeItem(const QString parentDirOnlinePath, const QString elemName, bool isDir)
+{
+    if (elemName.isEmpty()) {
         auto msg = "Cannot remove root directory";
         qDebug() << Q_FUNC_INFO << msg;
-        throw VfsCacheException(msg);
+        throw VfsCacheOpNotSuccessfulException(EPERM);
     }
 
-    qDebug() << Q_FUNC_INFO << "Removing directory '" << dirName << "' in:" << VfsUtils::getDirectory(onlinePath);
+    auto onlinePath = VfsUtils::pathJoin(parentDirOnlinePath, elemName);
+
+    if ((isDir && !this->isDir(onlinePath)) || (!isDir && !isFile(onlinePath)))
+        throw VfsCacheNoSuchElementException(onlinePath.toStdString());
+
+    qDebug() << Q_FUNC_INFO << "Removing" << (isDir ? "directory" : "file") << elemName << "in:" << parentDirOnlinePath;
 
     auto cacheFileInfo = cacheFile(onlinePath); // Ensure that changes are synced!
-    QDir parentDir = QDir(VfsUtils::getDirectory(cacheFileInfo->offlinePath));
-    parentDir.rmdir(dirName);
+    auto parentDirOfflinePath = VfsUtils::getDirectory(cacheFileInfo->offlinePath);
+    QDir parentDir = QDir(parentDirOfflinePath);
+    bool removed = true;
+    if (isDir)
+        removed = parentDir.rmdir(elemName);
+    else
+        removed = parentDir.remove(elemName);
+
+    if (!removed)
+        throw VfsCacheOpNotSuccessfulException(EACCES);
 
     {
-        qDebug() << Q_FUNC_INFO << "A";
         QMutexLocker locker(&_cacheOpRunning);
-        qDebug() << Q_FUNC_INFO << "B";
         _eng->journal()->forceRemoteDiscoveryNextSync();
         doSyncForFile(onlinePath);
-        qDebug() << Q_FUNC_INFO << "C";
 
         // Remove from cache -> File is removed
         _cachedFiles.remove(onlinePath);
         buildExcludeList();
-        qDebug() << Q_FUNC_INFO << "D";
 
         // Sync file list with remote
         loadFileList(VfsUtils::getDirectory(onlinePath));
-        qDebug() << Q_FUNC_INFO << "E";
     }
+
+    return true;
 }
 
 void VfsCache::writeFile(const QString onlinePath, const QString data, off_t offset)

@@ -61,6 +61,29 @@ public:
     }
 };
 
+class VfsCacheOpNotSuccessfulException : public VfsCacheException
+{
+private:
+    std::string _what;
+    int _err;
+
+public:
+    VfsCacheOpNotSuccessfulException(int err)
+        : _what("Operation was not successful: " + err)
+        , _err(err) {};
+
+    const char *what() const throw()
+    {
+        return _what.c_str();
+    }
+
+    int err()
+    {
+        return _err;
+    }
+};
+
+
 struct VfsCacheFileInfo
 {
     QString onlinePath;
@@ -136,7 +159,8 @@ private:
     void loadFileList(QString);
 
     QSharedPointer<VfsCacheFile> cacheFile(QString);
-    void cacheNewItem(const QString, const QString, bool);
+    bool createItem(const QString, const QString, bool);
+    bool removeItem(const QString, const QString, bool);
 
     void setSyncOptions();
     bool doSync();
@@ -177,6 +201,8 @@ public:
     const QString readFile(const QString, off_t, size_t);
     void createDirectory(const QString onlinePath);
     void removeDirectory(const QString onlinePath);
+    void removeFile(const QString onlinePath);
+    void createFile(const QString);
     void writeFile(const QString, const QString, off_t);
 };
 }

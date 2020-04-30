@@ -39,6 +39,9 @@ void VfsLinux::initFuseStatic()
     _ops.write = VfsLinux::doWrite;
     _ops.mkdir = VfsLinux::doMkdir;
     _ops.rmdir = VfsLinux::doRmdir;
+    _ops.create = VfsLinux::doCreate;
+    _ops.unlink = VfsLinux::doUnlink;
+    _ops.utimens = VfsLinux::doUtimens;
 
     fuse_initialized = true;
 }
@@ -151,6 +154,28 @@ int VfsLinux::mkdir(const char *c_path, mode_t mode, struct fuse_context *)
         // No such element
         qWarning() << Q_FUNC_INFO << "File" << c_path << "does not exist";
         return -ENOENT;
+    } catch (VfsCacheOpNotSuccessfulException &e) {
+        qCritical() << Q_FUNC_INFO << "Could not create directory:" << c_path;
+        return -e.err();
+    } catch (VfsCacheException &e) {
+        qCritical() << Q_FUNC_INFO << "Cache-internal error:" << e.what();
+        return -ENOENT;
+    }
+}
+
+int VfsLinux::unlink(const char *c_path, struct fuse_context *)
+{
+    try {
+        auto qpath = QString(c_path);
+        _cache->removeFile(qpath);
+        return 0;
+    } catch (VfsCacheNoSuchElementException &e) {
+        // No such element
+        qWarning() << Q_FUNC_INFO << "File" << c_path << "does not exist";
+        return -ENOENT;
+    } catch (VfsCacheOpNotSuccessfulException &e) {
+        qCritical() << Q_FUNC_INFO << "Could not remove file:" << c_path;
+        return -e.err();
     } catch (VfsCacheException &e) {
         qCritical() << Q_FUNC_INFO << "Cache-internal error:" << e.what();
         return -ENOENT;
@@ -169,9 +194,32 @@ int VfsLinux::rmdir(const char *c_path, struct fuse_context *)
         // No such element
         qWarning() << Q_FUNC_INFO << "File" << c_path << "does not exist";
         return -ENOENT;
+    } catch (VfsCacheOpNotSuccessfulException &e) {
+        qCritical() << Q_FUNC_INFO << "Could not remove directory:" << c_path;
+        return -e.err();
     } catch (VfsCacheException &e) {
         qCritical() << Q_FUNC_INFO << "Cache-internal error:" << e.what();
         return -ENOENT;
+    }
+}
+
+int VfsLinux::create(const char *c_path, mode_t, struct fuse_file_info *, struct fuse_context *)
+{
+    {
+        try {
+            _cache->createFile(QString(c_path));
+            return 0;
+        } catch (VfsCacheNoSuchElementException &e) {
+            // No such element
+            qWarning() << Q_FUNC_INFO << "File" << c_path << "does not exist";
+            return -ENOENT;
+        } catch (VfsCacheOpNotSuccessfulException &e) {
+            qCritical() << Q_FUNC_INFO << "Could not create file:" << c_path;
+            return -e.err();
+        } catch (VfsCacheException &e) {
+            qCritical() << Q_FUNC_INFO << "Cache-internal error:" << e.what();
+            return -ENOENT;
+        }
     }
 }
 
@@ -236,6 +284,29 @@ int VfsLinux::doRmdir(const char *c_path)
     return static_cast<VfsLinux *>(ctx->private_data)->rmdir(c_path, ctx);
 }
 
+int VfsLinux::doUtimens(const char *c_path, const struct timespec[2])
+{
+    // We no not really implement this function -> Make touch shut up
+    qDebug() << Q_FUNC_INFO << c_path;
+    return 0;
+}
+
+int VfsLinux::doUnlink(const char *c_path)
+{
+    qDebug() << Q_FUNC_INFO << c_path;
+
+    auto ctx = fuse_get_context();
+    return static_cast<VfsLinux *>(ctx->private_data)->unlink(c_path, ctx);
+}
+
+int VfsLinux::doCreate(const char *c_path, mode_t mode, struct fuse_file_info *fi)
+{
+    qDebug() << Q_FUNC_INFO << c_path << mode;
+
+    auto ctx = fuse_get_context();
+    return static_cast<VfsLinux *>(ctx->private_data)->create(c_path, mode, fi, ctx);
+}
+
 VfsLinux::VfsLinux(QString &mountPath, QString &cachePath, AccountState *accState)
     : _mountpath(mountPath)
     , _cachepath(cachePath)
@@ -275,7 +346,7 @@ void VfsLinux::mount()
     }
 
 
-    char *argv[0] = {};
+    char *argv[1] = { "-f" };
     struct fuse_args args = FUSE_ARGS_INIT(0, argv);
     if ((
             _fuseChan = fuse_mount(
