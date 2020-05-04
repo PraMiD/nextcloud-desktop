@@ -17,6 +17,7 @@
 #include <QThread>
 #include <QMutexLocker>
 #include <QScopedPointer>
+#include <QUuid>
 
 #include "config.h"
 #include "configfile.h"
@@ -38,6 +39,7 @@ VfsCache::VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs)
     , _cacheSecs(60)
     , _cacheOpRunning(QMutex::Recursive)
     , _syncOpRunning(QMutex::Recursive)
+    , _fastSync(false)
 {
     // Check if the cache directory exists
     auto file_info = QFileInfo(this->_cacheDir);
@@ -68,6 +70,14 @@ VfsCache::VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs)
         throw VfsCacheException(msg.toUtf8().constData());
     }
 
+    _surrogateDir = file_info.absoluteFilePath() + "/surrogates/";
+    if (!QDir::root().mkpath(_surrogateDir)) {
+        // Surrogate directory is a file..
+        auto msg = "Could not create directory for surrogate files: " + _fileCacheDir;
+        qCritical() << Q_FUNC_INFO << msg;
+        throw VfsCacheException(msg.toUtf8().constData());
+    }
+
     QString journalCacheDir = file_info.absoluteFilePath() + "/journal/";
     if (!QDir::root().mkpath(journalCacheDir)) {
         // Cache directory is a file..
@@ -77,16 +87,27 @@ VfsCache::VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs)
     }
 
     QFileInfo cacheMetaData(file_info.absoluteFilePath() + "/cache.store");
-    _metadataPath = cacheMetaData.absoluteFilePath();
+    _metadataCacheState = cacheMetaData.absoluteFilePath();
     if (cacheMetaData.exists()) {
         if (!cacheMetaData.isFile()) {
-            // Cache directory is a file..
-            auto msg = "Cache metadata path exists, but is no file: " + _metadataPath;
+            auto msg = "Cache metadata path exists, but is no file: " + _metadataCacheState;
             qCritical() << Q_FUNC_INFO << msg;
             throw VfsCacheException(msg.toUtf8().constData());
         }
 
         loadCacheState();
+    }
+
+    QFileInfo journalMetaData(file_info.absoluteFilePath() + "/cachejournal.store");
+    _metadataCacheJournalState = journalMetaData.absoluteFilePath();
+    if (journalMetaData.exists()) {
+        if (!journalMetaData.isFile()) {
+            auto msg = "Cache journal metadata path exists, but is no file: " + _metadataCacheJournalState;
+            qCritical() << Q_FUNC_INFO << msg;
+            throw VfsCacheException(msg.toUtf8().constData());
+        }
+
+        loadJournalState();
     }
 
     _dictWalker.setParent(this);
@@ -95,6 +116,7 @@ VfsCache::VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs)
 
     _journal = new SyncJournalDb(journalCacheDir + "cache.journal", this);
     _eng = new SyncEngine(accState->account(), _fileCacheDir, "/", _journal);
+    _eng->setIgnoreHiddenFiles(false);
     connect(_eng, &SyncEngine::started, this, &VfsCache::syncStarted);
     connect(_eng, &SyncEngine::finished, this, &VfsCache::syncFinished);
     connect(_eng, &SyncEngine::rootEtag, this, &VfsCache::etagReceived);
@@ -117,18 +139,24 @@ VfsCache::VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs)
                     qDebug() << Q_FUNC_INFO << "Refresh the directory listings of all currently cached directories";
                     _eng->setLocalDiscoveryOptions(LocalDiscoveryStyle::FilesystemOnly);
 
-
                     updateCurFileList();
                     if (checkCacheFiles()) // Remote discovery if files were removed from cache
                         _eng->journal()->forceRemoteDiscoveryNextSync();
                     buildExcludeList();
                     if (_syncOpRunning.try_lock())
                         doSync(); // Another sync is running -> fine
+                    processCacheJournal();
                 }
-                _cacheThread.msleep(_refreshTime);
+                _cacheThread.msleep(_fastSync ? 200 : _refreshTime);
+                _fastSync = false;
             }
         });
     _cacheThread.start();
+}
+
+void VfsCache::doFastSync()
+{
+    _fastSync = true;
 }
 
 bool VfsCache::doSync()
@@ -226,7 +254,27 @@ void VfsCache::engineItemProcessed(const SyncFileItemPtr &item)
 {
     auto file = QString("/" + item->_file);
 
-    qDebug() << Q_FUNC_INFO << "Keys:" << _waitForSyncFiles.keys() << "and current file" << file;
+    if (_cacheJournal.contains(file)) {
+        qDebug() << Q_FUNC_INFO << "Processing journal file:" << file;
+
+        auto journalFile = _cacheJournal.value(file);
+        if (!journalFile->opPerformed) {
+            qDebug() << Q_FUNC_INFO << "Operation not yet performed";
+        } else {
+            if (journalFile->op == JournalOperation::CREATE && item->_instruction == CSYNC_INSTRUCTION_NEW) {
+                qDebug() << Q_FUNC_INFO << "Item created";
+                journalFile->syncToRemote = true;
+                storeJournalState();
+            } else if (journalFile->op == JournalOperation::REMOVE && item->_instruction == CSYNC_INSTRUCTION_REMOVE) {
+                qDebug() << Q_FUNC_INFO << "Item removed";
+                journalFile->syncToRemote = true;
+                storeJournalState();
+            } else {
+                qDebug() << Q_FUNC_INFO << "What?? Journal:" << ((int)journalFile->op) << ". Engine: " << item->_instruction;
+            }
+        }
+    }
+
     if (_waitForSyncFiles.contains(file)) {
         qDebug() << Q_FUNC_INFO << "Processing wait file:" << file;
         auto mut = _waitForSyncFiles.value(file).first;
@@ -325,6 +373,9 @@ void VfsCache::loadFileList(QString path)
                 qWarning() << Q_FUNC_INFO << "Timeout while loading file list";
             }
 
+            if (!_fileMap.contains(path))
+                throw VfsCacheNoSuchElementException(path.toStdString());
+
             QStringList dirListing;
             for (auto &intFi : _fileMap.value(path)->list)
                 dirListing.append(intFi->path);
@@ -391,30 +442,90 @@ QSharedPointer<OCC::DiscoveryDirectoryResult> VfsCache::getIntDirInfo(QString pa
     }
 }
 
-QStringList VfsCache::getDirListing(QString path)
+QStringList VfsCache::getDirListingJournalFiles(QString path)
 {
-    auto intDirInfo = getIntDirInfo(path);
     QStringList dirListing;
+    if (!isDir(path))
+        throw VfsCacheNoSuchElementException(path.toUtf8().constData());
 
-    for (auto &intFi : intDirInfo->list)
-        dirListing.append(intFi->path);
+    for (auto &journalElem : _cacheJournal.values()) {
+        auto fPath = journalElem->onlinePath;
+        auto fPathParent = VfsUtils::getDirectory(fPath);
+        if (journalElem->op == JournalOperation::CREATE && fPathParent == path)
+            dirListing.append(VfsUtils::getFile(fPath));
+    }
 
     return dirListing;
+}
+
+QStringList VfsCache::getDirListing(QString path, bool remoteOnly)
+{
+    if (!remoteOnly && _cacheJournal.contains(path) && _cacheJournal.value(path)->op == JournalOperation::REMOVE) {
+        // File/Directory marked for removal
+        throw VfsCacheNoSuchElementException(path.toUtf8().constData());
+    }
+
+    if (!remoteOnly && _cacheJournal.contains(path)) {
+        auto journalFile = _cacheJournal.value(path);
+        if (journalFile->op == JournalOperation::CREATE && !journalFile->syncToRemote) {
+            // Directory currently only exists locally
+            return getDirListingJournalFiles(path);
+        }
+    }
+
+    try {
+        // Local + remote
+        QStringList dirListing = remoteOnly ? QStringList() : getDirListingJournalFiles(path);
+        auto intDirInfo = getIntDirInfo(path);
+
+        for (auto &intFi : intDirInfo->list) {
+            auto onlinePath = VfsUtils::pathJoin(path, intFi->path);
+            if (remoteOnly || !_cacheJournal.contains(onlinePath) || _cacheJournal.value(onlinePath)->op != JournalOperation::REMOVE)
+                dirListing.append(intFi->path);
+        }
+
+        return dirListing;
+    } catch (VfsCacheNoSuchElementException &e) {
+        // Maybe this file only exists in our journal?
+        if (remoteOnly || !(_cacheJournal.contains(path) && _cacheJournal.value(path)->op != JournalOperation::REMOVE))
+            throw;
+        return getDirListingJournalFiles(path);
+    }
 }
 
 VfsCacheFileInfo VfsCache::getFileInfo(QString path)
 {
     auto dirPath = VfsUtils::getDirectory(path);
     auto file = VfsUtils::getFile(path);
-    auto &dirListing = getIntDirInfo(dirPath)->list;
+    try {
+        auto &dirListing = getIntDirInfo(dirPath)->list;
 
-    auto intFiIt = std::find_if(dirListing.cbegin(), dirListing.cend(), [file](auto &intFi) { return intFi->path == file; });
-    if (intFiIt == dirListing.cend()) {
-        qWarning() << Q_FUNC_INFO << "File info of non-existing file" << path << "requested";
-        throw VfsCacheNoSuchElementException(path.toUtf8().constData());
+        auto intFiIt = std::find_if(dirListing.cbegin(), dirListing.cend(), [file](auto &intFi) { return intFi->path == file; });
+        if (intFiIt != dirListing.cend())
+            return fillFileInfo(*intFiIt, path);
+    } catch (VfsCacheNoSuchElementException &) {
+        // Try journal
     }
 
-    return fillFileInfo(*intFiIt, path);
+
+    // File is not on remote server -> Maybe it is in our journal?
+    if (_cacheJournal.contains(path)) {
+        auto journalFile = _cacheJournal.value(path);
+        if (journalFile->op != JournalOperation::REMOVE) {
+            QFileInfo surrogateFile(journalFile->journalSurrogateFilePath);
+
+            VfsCacheFileInfo fi;
+            fi.onlinePath = path;
+            fi.type = journalFile->type;
+            fi.size = surrogateFile.size();
+            fi.modTime = surrogateFile.lastModified();
+            fi.accessTime = surrogateFile.lastRead();
+
+            return fi;
+        }
+    }
+    qWarning() << Q_FUNC_INFO << "File info of non-existing file" << path << "requested";
+    throw VfsCacheNoSuchElementException(path.toUtf8().constData());
 }
 
 VfsCacheFileInfo VfsCache::fillFileInfo(const std::unique_ptr<csync_file_stat_t> &intFi, QString path)
@@ -544,8 +655,48 @@ bool VfsCache::createItem(const QString parentDirOnlinePath, const QString elemN
     if (!this->isDir(parentDirOnlinePath))
         throw VfsCacheNoSuchElementException(parentDirOnlinePath.toStdString());
 
-    QSharedPointer<VfsCacheFile> newFileInfo = QSharedPointer<VfsCacheFile>(new VfsCacheFile());
+
+    auto newJournalFile = QSharedPointer<VfsCacheJournalFile>(new VfsCacheJournalFile());
     auto onlinePath = VfsUtils::pathJoin(parentDirOnlinePath, elemName);
+
+    if (_cacheJournal.contains(onlinePath))
+        throw VfsCacheOpNotSuccessfulException(EAGAIN);
+
+    newJournalFile->onlinePath = onlinePath;
+    newJournalFile->type = isDir ? ItemType::ItemTypeDirectory : ItemType::ItemTypeFile;
+    newJournalFile->op = JournalOperation::CREATE;
+    newJournalFile->opPerformed = false;
+    newJournalFile->syncToRemote = false;
+
+    QString uuid = QUuid::createUuid().toString();
+    newJournalFile->journalSurrogateFilePath = VfsUtils::pathJoin(_surrogateDir, uuid);
+    bool created = false;
+    QDir surrogateFilesDir(_surrogateDir);
+    if (isDir) {
+        created = surrogateFilesDir.mkdir(uuid);
+    } else {
+        QFile newFile(newJournalFile->journalSurrogateFilePath);
+        if (newFile.open(QIODevice::ReadWrite)) {
+            created = true;
+            newFile.flush();
+            newFile.close();
+        }
+    }
+
+    if (!created)
+        throw VfsCacheOpNotSuccessfulException(EACCES);
+
+    for (auto &jf : _cacheJournal.values()) {
+        // A create operation depends on creation of parent directories
+        if (jf->onlinePath == VfsUtils::getDirectory(onlinePath))
+            newJournalFile->dependsOn.append(jf->onlinePath);
+    }
+
+    _cacheJournal.insert(newJournalFile->onlinePath, newJournalFile);
+    storeJournalState();
+    return true;
+
+    QSharedPointer<VfsCacheFile> newFileInfo = QSharedPointer<VfsCacheFile>(new VfsCacheFile());
     newFileInfo->onlinePath = onlinePath;
     newFileInfo->offlinePath = VfsUtils::pathJoin(_fileCacheDir, onlinePath.right(onlinePath.length() - 1));
     newFileInfo->download = newFileInfo->lastAccess = newFileInfo->lastModification = QDateTime::currentDateTime();
@@ -595,23 +746,155 @@ bool VfsCache::createItem(const QString parentDirOnlinePath, const QString elemN
     return true;
 }
 
-QSharedPointer<VfsCacheFile> VfsCache::cacheFile(QString onlinePath)
+void VfsCache::processCacheJournal()
+{
+    for (auto onlinePath : _cacheJournal.keys()) {
+        // Only create and remove operations are currently stored in the
+        // cache journal
+        auto journalFile = _cacheJournal.value(onlinePath);
+        if (journalFile->syncToRemote) {
+            // Fully handled
+            _cacheJournal.remove(onlinePath);
+
+            try {
+                cacheFile(onlinePath, false);
+            } catch (VfsCacheNoSuchElementException &) {
+                // Maybe not synched to our server file list
+            }
+            continue;
+        }
+        if (journalFile->opPerformed)
+            continue;
+
+        for (auto &dependJf : journalFile->dependsOn) {
+            if (_cacheJournal.contains(dependJf) && !_cacheJournal.value(dependJf)->opPerformed) {
+                qDebug() << "Wait for dependency" << dependJf << "of" << onlinePath;
+                continue;
+            }
+        }
+
+        auto parentOnlinePath = VfsUtils::getDirectory(onlinePath);
+
+        // Ensure that the parent directory is marked to be synced
+        auto parentOfflinePath = _fileCacheDir;
+        QSharedPointer<VfsCacheFile> parentCacheFile;
+        if (parentOnlinePath != "/") {
+            try {
+                parentCacheFile = cacheFile(parentOnlinePath, false);
+            } catch (VfsCacheNoSuchElementException &) {
+                if (!isDir(parentOnlinePath)) {
+                    // Parent directory deleted before?
+                    // We can ignore it when we want to delete the current element,
+                    // but this should not happen on CREATEs
+                    if (journalFile->op == JournalOperation::CREATE) {
+                        qCritical() << "Parent element" << parentOnlinePath << "does not exist anymore, but we want to create" << onlinePath;
+                    }
+                    _cacheJournal.remove(onlinePath);
+                }
+                continue;
+            }
+            parentOfflinePath = parentCacheFile->offlinePath;
+
+            // Check if the parent directory is already synced to our local copy
+            QFileInfo parentFileInfo(parentCacheFile->offlinePath);
+            if (!(parentFileInfo.exists() && parentFileInfo.isDir())) {
+                // Wait for remote sync
+                qDebug() << Q_FUNC_INFO << "Waiting for sync of parent dir of" << onlinePath;
+                _eng->journal()
+                    ->forceRemoteDiscoveryNextSync();
+                doFastSync();
+                continue;
+            }
+        }
+
+        auto isDir = journalFile->type == ItemType::ItemTypeDirectory;
+        QDir parentDir(parentOfflinePath);
+        auto elemName = VfsUtils::getFile(onlinePath);
+
+        switch (journalFile->op) {
+        case JournalOperation::CREATE: {
+            // Just create the file or directory
+            qDebug() << "Create new" << (isDir ? "directory" : "file") << "called" << elemName << "at cache path" << parentDir.absolutePath();
+
+
+            // Move the surrogate to its new location
+            bool created = false;
+            QDir surrogateFilesDir(VfsUtils::getDirectory(journalFile->journalSurrogateFilePath));
+            if (!QFile::exists(journalFile->journalSurrogateFilePath)) {
+                qWarning() << "Surrogate does not exist anymore.. Creating element directly";
+                if (isDir) {
+                    created = surrogateFilesDir.mkdir(VfsUtils::getFile(journalFile->journalSurrogateFilePath));
+                } else {
+                    QFile newFile(journalFile->journalSurrogateFilePath);
+                    if (newFile.open(QIODevice::ReadWrite)) {
+                        created = true;
+                        newFile.flush();
+                        newFile.close();
+                    }
+                }
+            } else {
+                created = QFile::rename(journalFile->journalSurrogateFilePath, VfsUtils::pathJoin(_fileCacheDir, journalFile->onlinePath));
+            }
+
+            journalFile->opPerformed = created;
+        } break;
+        case JournalOperation::REMOVE: {
+            // Cache the file itself and remove it
+            try {
+                auto elemCacheFile = cacheFile(onlinePath, false);
+
+                // Check if the file itself already exists locally
+                QFileInfo fi(elemCacheFile->offlinePath);
+                if (!(fi.exists() && (isDir ? fi.isDir() : fi.isFile()))) {
+                    qDebug() << Q_FUNC_INFO << "Waiting for sync of" << onlinePath;
+                    _eng->journal()
+                        ->forceRemoteDiscoveryNextSync();
+                    doFastSync();
+                    continue;
+                }
+
+                if (isDir ? parentDir.rmdir(elemName) : parentDir.remove(elemName))
+                    journalFile->opPerformed = true;
+            } catch (VfsCacheNoSuchElementException &e) {
+                // Journal got out of sync?
+                qWarning() << "Non-existing element should be deleted by journal. Is the journal cache out of sync?";
+
+                // The sync engine will never process this element anymore
+                _cacheJournal.remove(onlinePath);
+            }
+        } break;
+        }
+    }
+    storeJournalState();
+}
+
+QSharedPointer<VfsCacheFile> VfsCache::cacheFile(QString onlinePath, bool block)
 {
     QString onlineDir = VfsUtils::getDirectory(onlinePath);
     QString filename = VfsUtils::getFile(onlinePath);
 
     // Check if the file exists
-    auto files = getDirListing(onlineDir); // Throws an exception if the directory is not known
+    auto files = getDirListing(onlineDir, true); // Throws an exception if the directory is not known
     if (!files.contains(filename)) {
-        qWarning() << Q_FUNC_INFO << "Client requested not existing file: " << onlinePath;
-        throw VfsCacheNoSuchElementException(onlinePath.toUtf8().constData());
+        // The file does not exist 'officially' -> Maybe it exists, but is marked for removal?
+        if (_cacheJournal.contains(onlinePath) && _cacheJournal.value(onlinePath)->op == JournalOperation::REMOVE) {
+            qWarning() << Q_FUNC_INFO << "Client requested not existing file: " << onlinePath;
+            throw VfsCacheNoSuchElementException(onlinePath.toUtf8().constData());
+        }
     }
 
     {
         QMutexLocker locker(&_cacheOpRunning);
         // Check if the file is already cached
-        if (_cachedFiles.contains(onlinePath))
-            return _cachedFiles.value(onlinePath);
+        if (_cachedFiles.contains(onlinePath)) {
+            auto cacheFile = _cachedFiles.value(onlinePath);
+            if (!QFileInfo(cacheFile->offlinePath).exists()) {
+                _eng->journal()->forceRemoteDiscoveryNextSync();
+                if (block)
+                    doSyncForFile(onlinePath);
+            }
+            return cacheFile;
+        }
     }
 
     // Download file and add it to the cache
@@ -628,7 +911,8 @@ QSharedPointer<VfsCacheFile> VfsCache::cacheFile(QString onlinePath)
 
         // Blocks until the file is processed by the engine
         _eng->journal()->forceRemoteDiscoveryNextSync();
-        doSyncForFile(onlinePath);
+        if (block)
+            doSyncForFile(onlinePath);
     }
 
 
@@ -647,14 +931,21 @@ const QString VfsCache::readFile(const QString onlinePath, off_t offset, size_t 
     qDebug()
         << Q_FUNC_INFO << "FUSE read request:" << onlinePath;
 
-    // Cache file (if not already cached)
-    auto cachedFile = cacheFile(onlinePath);
-    cachedFile->lastAccess = QDateTime::currentDateTime();
+    QString offlinePath = "";
+    if (_cacheJournal.contains(onlinePath)) {
+        // We checked before if the file exists -> Cache operation is not REMOVE
+        offlinePath = _cacheJournal.value(onlinePath)->journalSurrogateFilePath;
+        qDebug()
+            << Q_FUNC_INFO << "Serve from journal:" << offlinePath;
+    } else {
+        // Cache file (if not already cached)
+        auto cachedFile = cacheFile(onlinePath, true);
+        cachedFile->lastAccess = QDateTime::currentDateTime();
+        offlinePath = cachedFile->offlinePath;
+        qDebug()
+            << Q_FUNC_INFO << "Serve from remove:" << offlinePath;
+    }
 
-
-    //auto fh = cachedFile->fh;
-    auto offlinePath = cachedFile->offlinePath;
-    //if (!fh) {
     auto fh = QSharedPointer<QFile>(new QFile(offlinePath));
     if (!fh->open(QIODevice::ReadOnly | QIODevice::Unbuffered)) {
         auto msg = QString("Could not open file (offline: " + offlinePath + "; online: " + onlinePath + " for reading");
@@ -725,7 +1016,41 @@ bool VfsCache::removeItem(const QString parentDirOnlinePath, const QString elemN
 
     qDebug() << Q_FUNC_INFO << "Removing" << (isDir ? "directory" : "file") << elemName << "in:" << parentDirOnlinePath;
 
-    auto cacheFileInfo = cacheFile(onlinePath); // Ensure that changes are synced!
+    auto newJournalFile = QSharedPointer<VfsCacheJournalFile>(new VfsCacheJournalFile());
+
+    if (_cacheJournal.contains(onlinePath)) {
+        // Another operation for the file is stored in the journal
+        auto journalFile = _cacheJournal.value(onlinePath);
+        if (journalFile->op == JournalOperation::REMOVE)
+            return true; // Already marked for removal
+
+        // We shall create the file
+        if (journalFile->opPerformed) {
+            _cacheJournal.remove(onlinePath); // Simply rewind the creation
+            return true;
+        }
+
+        // To late -> Sync and remove afterwards
+        throw VfsCacheOpNotSuccessfulException(EAGAIN);
+    }
+
+    newJournalFile->onlinePath = onlinePath;
+    newJournalFile->type = isDir ? ItemType::ItemTypeDirectory : ItemType::ItemTypeFile;
+    newJournalFile->op = JournalOperation::REMOVE;
+    newJournalFile->opPerformed = false;
+    newJournalFile->syncToRemote = false;
+
+    for (auto &jf : _cacheJournal.values()) {
+        // A remove operation depends on the removal of all subfiles/subdirs
+        if (onlinePath == VfsUtils::getDirectory(jf->onlinePath))
+            newJournalFile->dependsOn.append(jf->onlinePath);
+    }
+
+    _cacheJournal.insert(onlinePath, newJournalFile);
+    storeJournalState();
+    return true;
+
+    auto cacheFileInfo = cacheFile(onlinePath, true); // Ensure that changes are synced!
     auto parentDirOfflinePath = VfsUtils::getDirectory(cacheFileInfo->offlinePath);
     QDir parentDir = QDir(parentDirOfflinePath);
     bool removed = true;
@@ -762,21 +1087,27 @@ void VfsCache::writeFile(const QString onlinePath, const QString data, off_t off
 
     qDebug() << Q_FUNC_INFO << "FUSE write request:" << onlinePath;
 
-    // Cache file if not already cached
-    auto cachedFile = cacheFile(onlinePath);
-    cachedFile->lastAccess = cachedFile->lastModification = QDateTime::currentDateTime();
+    QString offlinePath = "";
+    if (_cacheJournal.contains(onlinePath)) {
+        // We checked before if the file exists -> Cache operation is not REMOVE
+        offlinePath = _cacheJournal.value(onlinePath)->journalSurrogateFilePath;
+        qDebug()
+            << Q_FUNC_INFO << "Serve from journal:" << offlinePath;
+    } else {
+        // Cache file (if not already cached)
+        auto cachedFile = cacheFile(onlinePath, true);
+        cachedFile->lastAccess = QDateTime::currentDateTime();
+        offlinePath = cachedFile->offlinePath;
+        qDebug()
+            << Q_FUNC_INFO << "Serve from remove:" << offlinePath;
+    }
 
-
-    //auto fh = cachedFile->fh;
-    auto offlinePath = cachedFile->offlinePath;
-    //if (!fh) {
     auto fh = QSharedPointer<QFile>(new QFile(offlinePath));
     if (!fh->open(QIODevice::ReadWrite | QIODevice::Unbuffered)) { // RW for seeking ;)
         auto msg = QString("Could not open file (offline: " + offlinePath + "; online: " + onlinePath + " for writing");
         qCritical() << Q_FUNC_INFO << msg;
         throw VfsCacheException(msg.toStdString());
     }
-    //}
 
     if (!fh->seek(offset)) {
         auto msg = QString("Could not seek to offset in file (offline: " + offlinePath + "; online: " + onlinePath);
@@ -798,6 +1129,8 @@ bool VfsCache::isFile(QString path)
 
 bool VfsCache::isDir(QString path)
 {
+    if (path == "/")
+        return true;
     return getFileInfo(path).type == ItemType::ItemTypeDirectory;
 }
 
@@ -826,20 +1159,67 @@ bool VfsCache::checkCacheFiles()
     return !toRemove.empty();
 }
 
+void VfsCache::loadJournalState()
+{
+    qDebug() << "Load cache journal file: " << _metadataCacheJournalState;
+
+    QFile journalStateFile(_metadataCacheJournalState);
+
+    if (!journalStateFile.exists()) {
+        QString msg = "Cannot read cache journal state, file does not exist: " + _metadataCacheJournalState;
+        qCritical() << msg;
+        throw VfsCacheException(msg.toStdString());
+    }
+
+    if (!journalStateFile.open(QIODevice::ReadOnly)) {
+        QString msg = "Cannot read cache journal state, cannot open file: " + _metadataCacheJournalState;
+        qCritical() << msg;
+        throw VfsCacheException(msg.toStdString());
+    }
+
+    QList<VfsCacheJournalFile> cacheJournalFileList;
+    QDataStream instream(&journalStateFile);
+    instream >> cacheJournalFileList;
+    journalStateFile.close();
+
+    for (auto &jf : cacheJournalFileList)
+        _cacheJournal.insert(jf.onlinePath, QSharedPointer<VfsCacheJournalFile>(new VfsCacheJournalFile(jf)));
+}
+
+void VfsCache::storeJournalState()
+{
+    qDebug() << "Store cache journal file: " << _metadataCacheJournalState;
+
+    QFile journalStateFile(_metadataCacheJournalState);
+
+    if (!journalStateFile.open(QIODevice::WriteOnly | QIODevice::Unbuffered)) {
+        QString msg = "Cannot write cache state, cannot open file: " + _metadataCacheJournalState;
+        qCritical() << msg;
+        throw VfsCacheException(msg.toStdString());
+    }
+
+    QList<VfsCacheJournalFile> cacheJournalFileList;
+    for (auto &journalFile : _cacheJournal.values())
+        cacheJournalFileList.append(*journalFile);
+    QDataStream outstream(&journalStateFile);
+    outstream << cacheJournalFileList;
+    journalStateFile.close();
+}
+
 void VfsCache::loadCacheState()
 {
-    qDebug() << "Load cache file: " << _metadataPath;
+    qDebug() << "Load cache file: " << _metadataCacheState;
 
-    QFile cacheStateFile(_metadataPath);
+    QFile cacheStateFile(_metadataCacheState);
 
     if (!cacheStateFile.exists()) {
-        QString msg = "Cannot read cache state, file does not exist: " + _metadataPath;
+        QString msg = "Cannot read cache state, file does not exist: " + _metadataCacheState;
         qCritical() << msg;
         throw VfsCacheException(msg.toStdString());
     }
 
     if (!cacheStateFile.open(QIODevice::ReadOnly)) {
-        QString msg = "Cannot read cache state, cannot open file: " + _metadataPath;
+        QString msg = "Cannot read cache state, cannot open file: " + _metadataCacheState;
         qCritical() << msg;
         throw VfsCacheException(msg.toStdString());
     }
@@ -859,12 +1239,12 @@ void VfsCache::loadCacheState()
 
 void VfsCache::storeCacheState()
 {
-    qDebug() << "Store cache file: " << _metadataPath;
+    qDebug() << "Store cache file: " << _metadataCacheState;
 
-    QFile cacheStateFile(_metadataPath);
+    QFile cacheStateFile(_metadataCacheState);
 
     if (!cacheStateFile.open(QIODevice::WriteOnly | QIODevice::Unbuffered)) {
-        QString msg = "Cannot write cache state, cannot open file: " + _metadataPath;
+        QString msg = "Cannot write cache state, cannot open file: " + _metadataCacheState;
         qCritical() << msg;
         throw VfsCacheException(msg.toStdString());
     }

@@ -23,6 +23,8 @@ class VfsUtils : public QObject
     Q_OBJECT
 
 public:
+    static QString pathSeparator;
+
     static QString getDirectory(QString);
     static QString getFile(QString);
     static QString pathJoin(QString, QString);

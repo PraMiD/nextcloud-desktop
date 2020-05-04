@@ -93,6 +93,37 @@ struct VfsCacheFileInfo
     off_t size;
 };
 
+enum class JournalOperation {
+    CREATE,
+    REMOVE
+};
+
+struct VfsCacheJournalFile
+{
+    QString onlinePath;
+    ItemType type;
+    JournalOperation op;
+    QString journalSurrogateFilePath;
+    bool opPerformed;
+    bool syncToRemote;
+    QStringList dependsOn;
+
+    friend QDataStream &operator<<(QDataStream &out, const VfsCacheJournalFile &journalFile)
+    {
+        out << journalFile.onlinePath << qint8(journalFile.type) << qint8(journalFile.op) << journalFile.journalSurrogateFilePath << journalFile.opPerformed << journalFile.syncToRemote << journalFile.dependsOn;
+        return out;
+    }
+
+    friend QDataStream &operator>>(QDataStream &in, VfsCacheJournalFile &journalFile)
+    {
+        qint8 intType, intOp;
+        in >> journalFile.onlinePath >> intType >> intOp >> journalFile.journalSurrogateFilePath >> journalFile.opPerformed >> journalFile.syncToRemote >> journalFile.dependsOn;
+        journalFile.type = ItemType(intType);
+        journalFile.op = JournalOperation(intOp);
+        return in;
+    }
+};
+
 struct VfsCacheFile
 {
     QDateTime lastAccess;
@@ -122,8 +153,10 @@ class VfsCache : public QObject
 private:
     QPointer<AccountState> _accState;
     QString _cacheDir;
-    QString _metadataPath;
+    QString _metadataCacheState;
+    QString _metadataCacheJournalState;
     QString _fileCacheDir;
+    QString _surrogateDir;
     QThread _cacheThread;
     int _refreshTime;
 
@@ -137,9 +170,13 @@ private:
 
     SyncJournalDb *_journal;
     SyncEngine *_eng;
+    bool _fastSync;
 
     QMap<QString, QSharedPointer<OCC::DiscoveryDirectoryResult>> _fileMap;
     QMap<QString, QSharedPointer<VfsCacheFile>> _cachedFiles;
+
+    // Use for create and remove
+    QMap<QString, QSharedPointer<VfsCacheJournalFile>> _cacheJournal;
     qint64 _cacheSecs;
 
     QMap<QString, QPair<QSharedPointer<QMutex>, QSharedPointer<QWaitCondition>>> _waitForSyncFiles;
@@ -154,11 +191,13 @@ private:
 
     void loadCacheState();
     void storeCacheState();
+    void loadJournalState();
+    void storeJournalState();
 
     void updateCurFileList();
     void loadFileList(QString);
 
-    QSharedPointer<VfsCacheFile> cacheFile(QString);
+    QSharedPointer<VfsCacheFile> cacheFile(QString, bool);
     bool createItem(const QString, const QString, bool);
     bool removeItem(const QString, const QString, bool);
 
@@ -179,6 +218,10 @@ private:
     QSharedPointer<OCC::DiscoveryDirectoryResult> getIntDirInfo(QString);
     VfsCacheFileInfo fillFileInfo(const std::unique_ptr<csync_file_stat_t> &, QString);
 
+    void processCacheJournal();
+    QStringList getDirListingJournalFiles(QString);
+    void doFastSync();
+
 
 private slots:
     void handleDirectoryUpdate(OCC::DiscoveryDirectoryResult *);
@@ -196,7 +239,7 @@ public:
     VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs = 10000);
     ~VfsCache();
 
-    QStringList getDirListing(QString);
+    QStringList getDirListing(QString, bool = false);
     VfsCacheFileInfo getFileInfo(QString);
     const QString readFile(const QString, off_t, size_t);
     void createDirectory(const QString onlinePath);

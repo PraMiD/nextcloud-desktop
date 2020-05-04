@@ -15,17 +15,24 @@
 #include "vfs_utils.h"
 
 namespace OCC {
-QString VfsUtils::getDirectory(QString path)
+#if defined(Q_OS_WIN)
+QString VfsUtils::pathSeparator = "\\";
+#else
+QString VfsUtils::pathSeparator = "/";
+#endif
+
+QString
+VfsUtils::getDirectory(QString path)
 {
-    if (path.endsWith("/"))
+    if (path.endsWith(pathSeparator))
         path.chop(1);
 
-    auto lastSep = path.lastIndexOf("/");
+    auto lastSep = path.lastIndexOf(pathSeparator);
     if (lastSep == -1)
-        return "/";
+        return pathSeparator;
 
     auto dir = path.left(lastSep + 1);
-    while (dir.endsWith("/") && dir.length() > 1)
+    while (dir.endsWith(pathSeparator) && dir.length() > 1)
         dir.chop(1);
 
     return dir;
@@ -33,10 +40,10 @@ QString VfsUtils::getDirectory(QString path)
 
 QString VfsUtils::getFile(QString path)
 {
-    if (path.endsWith("/"))
+    if (path.endsWith(pathSeparator))
         return QString();
 
-    auto lastSep = path.lastIndexOf("/");
+    auto lastSep = path.lastIndexOf(pathSeparator);
     if (lastSep == -1)
         return path;
 
@@ -45,12 +52,6 @@ QString VfsUtils::getFile(QString path)
 
 QString VfsUtils::pathJoin(QString dir, QString file)
 {
-#if defined(Q_OS_WIN)
-    QString separator = "\\";
-#else
-    QString separator = "/";
-#endif
-
-    return dir.endsWith(separator) ? QString(dir + file) : QString(dir + separator + file);
+    return dir.endsWith(pathSeparator) ? QString(dir + file) : QString(dir + pathSeparator + file);
 }
 }
