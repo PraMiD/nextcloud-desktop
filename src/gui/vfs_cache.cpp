@@ -924,7 +924,7 @@ QSharedPointer<VfsCacheFile> VfsCache::cacheFile(QString onlinePath, bool block)
 const QString VfsCache::readFile(const QString onlinePath, off_t offset, size_t noBytes)
 {
     if (!isFile(onlinePath)) {
-        qCritical() << Q_FUNC_INFO << "FUSE requested unknown existing file:" << onlinePath;
+        qCritical() << Q_FUNC_INFO << "FUSE requested non-existing file:" << onlinePath;
         throw VfsCacheNoSuchElementException(onlinePath.toStdString());
     }
 
@@ -1081,7 +1081,7 @@ bool VfsCache::removeItem(const QString parentDirOnlinePath, const QString elemN
 void VfsCache::writeFile(const QString onlinePath, const QString data, off_t offset)
 {
     if (!isFile(onlinePath)) {
-        qCritical() << Q_FUNC_INFO << "FUSE requested unknown existing file:" << onlinePath;
+        qCritical() << Q_FUNC_INFO << "FUSE requested non-existing file:" << onlinePath;
         throw VfsCacheNoSuchElementException(onlinePath.toStdString());
     }
 
@@ -1120,6 +1120,36 @@ void VfsCache::writeFile(const QString onlinePath, const QString data, off_t off
     fh->close();
     // Thread loop syncs the file
 }
+
+void VfsCache::truncateFile(const QString onlinePath, off_t newLen)
+{
+    if (!isFile(onlinePath)) {
+        qCritical() << Q_FUNC_INFO << "FUSE requested non-existing file:" << onlinePath;
+        throw VfsCacheNoSuchElementException(onlinePath.toStdString());
+    }
+
+    qDebug() << Q_FUNC_INFO << "FUSE truncate request:" << onlinePath;
+
+    QString offlinePath = "";
+    if (_cacheJournal.contains(onlinePath)) {
+        // We checked before if the file exists -> Cache operation is not REMOVE
+        offlinePath = _cacheJournal.value(onlinePath)->journalSurrogateFilePath;
+        qDebug()
+            << Q_FUNC_INFO << "Serve from journal:" << offlinePath;
+    } else {
+        // Cache file (if not already cached)
+        auto cachedFile = cacheFile(onlinePath, true);
+        cachedFile->lastAccess = QDateTime::currentDateTime();
+        offlinePath = cachedFile->offlinePath;
+        qDebug()
+            << Q_FUNC_INFO << "Serve from remove:" << offlinePath;
+    }
+
+    auto fh = QSharedPointer<QFile>(new QFile(offlinePath));
+    fh->resize(newLen);
+    // Thread loop syncs the file
+}
+
 
 bool VfsCache::isFile(QString path)
 {

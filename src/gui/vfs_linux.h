@@ -61,6 +61,7 @@ private:
     int rmdir(const char *, struct fuse_context *);
     int create(const char *, mode_t, struct fuse_file_info *, struct fuse_context *);
     int unlink(const char *, struct fuse_context *);
+    int truncate(const char *, off_t, struct fuse_context *);
 
     static bool fuse_initialized;
     static struct fuse_operations _ops;
@@ -76,6 +77,7 @@ private:
     static int doRmdir(const char *);
     static int doCreate(const char *, mode_t, struct fuse_file_info *);
     static int doUnlink(const char *);
+    static int doTruncate(const char *, off_t);
     static int doUtimens(const char *c_path, const struct timespec[2]);
 };
 } // namespace OCC

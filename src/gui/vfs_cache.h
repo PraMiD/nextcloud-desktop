@@ -247,6 +247,7 @@ public:
     void removeFile(const QString onlinePath);
     void createFile(const QString);
     void writeFile(const QString, const QString, off_t);
+    void truncateFile(const QString, off_t);
 };
 }
 

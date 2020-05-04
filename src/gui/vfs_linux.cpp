@@ -42,6 +42,7 @@ void VfsLinux::initFuseStatic()
     _ops.create = VfsLinux::doCreate;
     _ops.unlink = VfsLinux::doUnlink;
     _ops.utimens = VfsLinux::doUtimens;
+    _ops.truncate = VfsLinux::doTruncate;
 
     fuse_initialized = true;
 }
@@ -135,6 +136,21 @@ int VfsLinux::write(const char *c_path, const char *buf, size_t size, off_t off,
     try {
         _cache->writeFile(QString(c_path), QString::fromStdString(std::string(buf, size)), off);
         return size;
+    } catch (VfsCacheNoSuchElementException &e) {
+        // No such element
+        qWarning() << Q_FUNC_INFO << "File" << c_path << "does not exist";
+        return -ENOENT;
+    } catch (VfsCacheException &e) {
+        qCritical() << Q_FUNC_INFO << "Cache-internal error:" << e.what();
+        return -ENOENT;
+    }
+}
+
+int VfsLinux::truncate(const char *c_path, off_t newLen, struct fuse_context *)
+{
+    try {
+        _cache->truncateFile(QString(c_path), newLen);
+        return 0;
     } catch (VfsCacheNoSuchElementException &e) {
         // No such element
         qWarning() << Q_FUNC_INFO << "File" << c_path << "does not exist";
@@ -298,6 +314,13 @@ int VfsLinux::doUnlink(const char *c_path)
     auto ctx = fuse_get_context();
     return static_cast<VfsLinux *>(ctx->private_data)->unlink(c_path, ctx);
 }
+int VfsLinux::doTruncate(const char *c_path, off_t newSize)
+{
+    qDebug() << Q_FUNC_INFO << c_path << newSize;
+
+    auto ctx = fuse_get_context();
+    return static_cast<VfsLinux *>(ctx->private_data)->truncate(c_path, newSize, ctx);
+}
 
 int VfsLinux::doCreate(const char *c_path, mode_t mode, struct fuse_file_info *fi)
 {
@@ -346,7 +369,7 @@ void VfsLinux::mount()
     }
 
 
-    char *argv[1] = { "-f" };
+    char *argv[0] = {};
     struct fuse_args args = FUSE_ARGS_INIT(0, argv);
     if ((
             _fuseChan = fuse_mount(
