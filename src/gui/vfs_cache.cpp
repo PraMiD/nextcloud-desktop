@@ -36,7 +36,7 @@ VfsCache::VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs)
     , _refreshTime(refreshTimeMs)
     , _dictWalker(accState->account())
     , _threadRunning(false)
-    , _cacheSecs(60)
+    , _cacheSecs(604800)
     , _cacheOpRunning(QMutex::Recursive)
     , _syncOpRunning(QMutex::Recursive)
     , _fastSync(false)
@@ -148,6 +148,8 @@ VfsCache::VfsCache(QString cacheDir, AccountState *accState, int refreshTimeMs)
                     processCacheJournal();
                 }
                 _cacheThread.msleep(_fastSync ? 200 : _refreshTime);
+                //qDebug() << "SYNCTEST" << QDateTime::currentDateTime().toString("hh:mm:ss.zzz");
+
                 _fastSync = false;
             }
         });
@@ -210,7 +212,7 @@ void VfsCache::setSyncOptions()
     ConfigFile cfgFile;
 
     auto newFolderLimit = cfgFile.newBigFolderSizeLimit();
-    opt._newBigFolderSizeLimit = newFolderLimit.first ? newFolderLimit.second * 1000LL * 1000LL : -1; // convert from MB to B
+    opt._newBigFolderSizeLimit = -1;
     opt._confirmExternalStorage = cfgFile.confirmExternalStorage();
     opt._moveFilesToTrash = cfgFile.moveToTrash();
 
@@ -540,15 +542,18 @@ VfsCacheFileInfo VfsCache::fillFileInfo(const std::unique_ptr<csync_file_stat_t>
         if (_cachedFiles.contains(path)) {
             // File cached -> Load values from local copy as they might not be synced to remote
             auto cacheFile = _cachedFiles.value(path);
-            fi.accessTime = cacheFile->lastAccess;
-            fi.modTime = cacheFile->lastModification;
-            fi.size = QFile(cacheFile->offlinePath).size();
-        } else {
-            fi.accessTime = QDateTime();
-            fi.accessTime.setSecsSinceEpoch(intFi->modtime);
-            fi.modTime = fi.accessTime;
-            fi.size = intFi->size;
+
+            if (QFile::exists(cacheFile->offlinePath)) {
+                fi.accessTime = cacheFile->lastAccess;
+                fi.modTime = cacheFile->lastModification;
+                fi.size = QFile(cacheFile->offlinePath).size();
+            }
+            return fi;
         }
+        fi.accessTime = QDateTime();
+        fi.accessTime.setSecsSinceEpoch(intFi->modtime);
+        fi.modTime = fi.accessTime;
+        fi.size = intFi->size;
     }
 
     return fi;
@@ -802,7 +807,11 @@ void VfsCache::processCacheJournal()
                 qDebug() << Q_FUNC_INFO << "Waiting for sync of parent dir of" << onlinePath;
                 _eng->journal()
                     ->forceRemoteDiscoveryNextSync();
-                doFastSync();
+                try {
+                    if (journalFile->op == JournalOperation::REMOVE && getFileInfo(onlinePath).size < 1024 * 1024)
+                        doFastSync();
+                } catch (VfsCacheException &e) {
+                }
                 continue;
             }
         }
@@ -849,7 +858,14 @@ void VfsCache::processCacheJournal()
                     qDebug() << Q_FUNC_INFO << "Waiting for sync of" << onlinePath;
                     _eng->journal()
                         ->forceRemoteDiscoveryNextSync();
-                    doFastSync();
+
+                    // Only do a fast sync if the file is rather small
+                    try {
+                        auto intFi = getFileInfo(onlinePath);
+                        if (intFi.size < 1024 * 1024)
+                            doFastSync();
+                    } catch (VfsCacheException &e) {
+                    }
                     continue;
                 }
 
