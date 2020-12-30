@@ -175,6 +175,12 @@ IF( WIN32 )
 ENDIF()
 
 IF( NOT WIN32 AND NOT APPLE )
+    list(APPEND client_SRCS vfs_linux.cpp)
+    list(APPEND client_SRCS vfs_cache.cpp)
+    list(APPEND client_SRCS vfs_cache_element.cpp)
+ENDIF()
+
+IF( NOT WIN32 AND NOT APPLE )
 set(client_SRCS ${client_SRCS} folderwatcher_linux.cpp)
 ENDIF()
 IF( WIN32 )
